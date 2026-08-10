@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zotero-mcp-local"
+version = "0.7.0"
+description = "Cross-platform local Zotero MCP server with guarded Web API writes"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+dependencies = [
+    "anyio>=4,<5",
+    "mcp>=1.27,<2",
+    "pydantic>=2.11,<3",
+    "requests>=2.31,<3",
+]
+
+[project.optional-dependencies]
+dev = ["ruff>=0.16,<1"]
+
+[project.scripts]
+zotero-mcp = "zotero_mcp.zotero_mcp_server:main"
+zotero-mcp-setup = "zotero_mcp.zotero_setup:main"
+zotero-mineru = "zotero_mcp.mineru_workflow:main"
+zotero-mineru-qmd = "zotero_mcp.mineru_qmd_pipeline:main"
+zotero-translate = "zotero_mcp.zotero_translate:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
