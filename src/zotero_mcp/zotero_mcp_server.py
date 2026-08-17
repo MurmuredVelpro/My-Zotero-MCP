@@ -893,11 +893,23 @@ TRANSLATION_RENAME_ITEM_SCHEMA: dict[str, Any] = {
             "type": "string",
             "pattern": "^[A-Z0-9]{8}$",
         },
+        "new_title": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Exact configured attachment title returned by the plan.",
+        },
+        "new_filename": {
+            "type": "string",
+            "minLength": 5,
+            "description": "Exact configured PDF filename returned by the plan.",
+        },
     },
     "required": [
         "parent_item_key",
         "source_attachment_key",
         "translation_attachment_key",
+        "new_title",
+        "new_filename",
     ],
     "additionalProperties": False,
 }
@@ -1376,8 +1388,8 @@ TOOLS: dict[str, dict[str, Any]] = {
             "Read-only preflight for PDF2zh attachments created through Zotero's manual "
             "translation command. Resolves each exact paper or child key to its top-level "
             "paper, identifies one English source PDF and one translated PDF, checks local/cloud "
-            "agreement and filename conflicts, and proposes title CN plus an English-source "
-            "filename ending in 的全文翻译.pdf. Performs no write."
+            "agreement and filename conflicts, and proposes the configured attachment title "
+            "and filename template. Performs no write."
         ),
         "inputSchema": {
             "type": "object",

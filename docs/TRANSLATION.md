@@ -17,9 +17,21 @@ This workflow removes per-paper right-click submission while keeping the officia
 4. Configure WebDAV in Zotero and verify synchronization. Use the exact HTTPS attachment directory URL, normally the configured base URL plus `/zotero/`, when saving the Worker secret.
 5. Create a Zotero Web API key with personal-library and file-write access. Save it with `zotero-mcp setup save-secret zotero`.
 6. Save the WebDAV credentials through hidden terminal input with `zotero-mcp setup save-secret webdav`.
-7. Run `zotero-translate doctor`. It checks PDF2zh Server health, Zotero Local API, Zotero Web API file-write permission, and WebDAV reachability without translating or uploading a file. The first real non-dry-run batch verifies WebDAV write access with a temporary zero-byte object and deletes it before translation starts.
+7. Run `zotero-translate doctor`. It validates the attachment naming configuration and checks PDF2zh Server health, Zotero Local API, Zotero Web API file-write permission, and WebDAV reachability without translating or uploading a file. The first real non-dry-run batch verifies WebDAV write access with a temporary zero-byte object and deletes it before translation starts.
 
 Codex guides these steps and pauses at account, browser, and secret-entry gates. Provider credentials are never accepted through chat.
+
+## Attachment naming
+
+Unattended imports and manual-translation renames share one naming configuration:
+
+```toml
+[translation]
+attachment_title = "CN"
+filename_template = "{source_stem}的全文翻译.pdf"
+```
+
+Change the values to match the user's filing convention. For example, `attachment_title = "Chinese"` and `filename_template = "{source_stem} (Chinese).pdf"` are valid. The filename template must contain and may only use `{source_stem}`; format specs, conversions, unknown variables, paths, and non-PDF results are rejected before any write. Missing keys use the defaults shown above. Attachments with the legacy title `CN` remain recognized after customization so a configuration change cannot create a duplicate translation attachment.
 
 ## Queue papers
 
@@ -35,7 +47,7 @@ Queue a collection resolved by exact key, globally unique name, or full path:
 zotero-translate enqueue --collection "Root > Topic" --recursive
 ```
 
-The Worker reuses Zotero MCP's English-PDF selection rules and locks the selected source attachment key. Existing `CN` attachments are recorded as complete.
+The Worker reuses Zotero MCP's English-PDF selection rules and locks the selected source attachment key. Attachments using the configured title or the legacy title `CN` are recorded as complete.
 
 ## Inspect and run
 
@@ -48,16 +60,16 @@ zotero-translate run --qps 10 --pool-size 20 --max-items 3
 
 `--max-items` limits how many pending papers this invocation may consume. It does not change the queue or create a recurring schedule.
 
-The Worker requests one Chinese monolingual PDF without a watermark. It reads the returned `fileList`, downloads the selected file from `/translatedFile/<filename>`, validates the PDF, then imports an attachment titled `CN`. The attachment filename preserves the English source stem and appends `的全文翻译.pdf`.
+The Worker requests one Chinese monolingual PDF without a watermark. It reads the returned `fileList`, downloads the selected file from `/translatedFile/<filename>`, validates the PDF, then applies the configured attachment title and filename template.
 
 ## Repair names after manual translation
 
 Manual translation from Zotero remains supported without changing PDF2zh source code. After PDF2zh creates the translated attachment:
 
 1. Call `zotero_plan_manual_translation_rename` with exact parent or child item keys. It identifies one English source PDF and one PDF2zh translation, checks local/cloud agreement and filename conflicts, and performs no write.
-2. Review the returned `parent_item_key`, `source_attachment_key`, and `translation_attachment_key`.
-3. After explicit approval, call `zotero_apply_manual_translation_rename` with those exact keys and `confirm=true`.
-4. Run Zotero sync. The attachment title becomes `CN`; the stored filename becomes the English source stem plus `的全文翻译.pdf`.
+2. Review the returned `parent_item_key`, `source_attachment_key`, `translation_attachment_key`, `new_title`, and `new_filename`.
+3. After explicit approval, call `zotero_apply_manual_translation_rename` with those exact reviewed values and `confirm=true`.
+4. Run Zotero sync. The attachment title and stored filename become the configured values shown in the plan.
 
 The apply step uses a versioned Web API PATCH and cloud readback. It does not change the PDF content, parent paper metadata, annotations, or attachment key. Ambiguous translated attachments, local/cloud disagreement, and existing target filenames block the write.
 
@@ -67,6 +79,8 @@ Automatic rename is disabled by default. Enable it in the user config only when 
 
 ```toml
 [translation]
+attachment_title = "CN"
+filename_template = "{source_stem}的全文翻译.pdf"
 auto_rename_manual = true
 rename_poll_seconds = 30
 ```

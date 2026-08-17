@@ -390,6 +390,8 @@ class CollectionToolTests(unittest.TestCase):
                 "parent_item_key": "ABCD1234",
                 "source_attachment_key": "EFGH5678",
                 "translation_attachment_key": "CNAT1234",
+                "new_title": "CN",
+                "new_filename": "Paper的全文翻译.pdf",
             }
         ]
         with mock.patch.object(
@@ -402,6 +404,18 @@ class CollectionToolTests(unittest.TestCase):
             )
         self.assertFalse(result["isError"])
         apply.assert_called_once_with(items, True)
+
+        required = set(zotero_mcp_server.TRANSLATION_RENAME_ITEM_SCHEMA["required"])
+        self.assertEqual(
+            required,
+            {
+                "parent_item_key",
+                "source_attachment_key",
+                "translation_attachment_key",
+                "new_title",
+                "new_filename",
+            },
+        )
 
     def test_web_api_status_tool_checks_web_api(self):
         status = {

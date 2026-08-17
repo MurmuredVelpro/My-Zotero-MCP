@@ -83,6 +83,8 @@ command = "qmd"
 collection = "zotero-mineru"
 
 [translation]
+attachment_title = "CN"
+filename_template = "{source_stem}的全文翻译.pdf"
 auto_rename_manual = false
 rename_poll_seconds = 30
 ```
@@ -108,9 +110,9 @@ Install PDF2zh from its official project and configure its Server, `pdf2zh_next`
 zotero-translate doctor
 ```
 
-The command reads the official Zotero preferences at runtime and reports only the selected service, model, Server URL, and readiness booleans. It checks WebDAV reachability without writing; a real non-dry-run batch performs a temporary write-and-delete probe before translation.
+The command reads the official Zotero preferences and Zotero MCP naming configuration at runtime. It reports the selected service, model, Server URL, naming values, and readiness booleans without exposing credentials. It checks WebDAV reachability without writing; a real non-dry-run batch performs a temporary write-and-delete probe before translation.
 
-Users who want Zotero's manual translation command to produce consistently named attachments can opt into the background rename monitor described in [TRANSLATION.md](TRANSLATION.md#optional-automatic-mode). The setting is disabled by default and the first scan establishes a checkpoint without changing historical attachments.
+Translation attachment titles and filenames are configurable under `[translation]`; the generated values above preserve the default behavior. `filename_template` must contain and may only use `{source_stem}`, and it must render one `.pdf` filename. Users who want Zotero's manual translation command to produce consistently named attachments can opt into the background rename monitor described in [TRANSLATION.md](TRANSLATION.md#optional-automatic-mode). The setting is disabled by default and the first scan establishes a checkpoint without changing historical attachments.
 
 ## 6. Add MCP servers to Codex
 

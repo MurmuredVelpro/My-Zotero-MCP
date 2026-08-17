@@ -56,7 +56,7 @@ zotero-mcp setup plan --profile full
 - 通过 plan/apply 两阶段工具导入论文、调整 collection、删除 PDF 附件
 - 可选使用 MinerU 批量解析 PDF，并用 QMD 建立全文检索
 - 在用户现有 collection 标准下，用 QMD 全文证据协同规划和执行文献整理
-- 调用官方 PDF2zh Server 批量翻译全文，自动下载并导入标题为 `CN`、文件名为“英文原文件名的全文翻译.pdf”的译文附件
+- 调用官方 PDF2zh Server 批量翻译全文，按用户配置自动命名、下载并导入译文附件；默认标题为 `CN`，文件名为“英文原文件名的全文翻译.pdf”
 - 按 toolset 控制暴露给 Agent 的工具
 
 所有 apply 工具要求精确 key 和明确的 `confirm=true`。Web API 写入前会重新读取云端状态，写后回读核验。
@@ -137,7 +137,15 @@ zotero-translate schedule --at "2026-08-15 22:00" --qps 10 --pool-size 20 --max-
 
 QPS、poolSize、最多处理篇数和运行时间每批显式提供。正式运行去掉 `--dry-run`。完整配置、队列和失败恢复见 [docs/TRANSLATION.md](docs/TRANSLATION.md)。
 
-用户仍可在 Zotero 中手动提交单篇翻译。默认可通过 maintenance toolset 的 plan/apply 工具事后重命名；也可在用户配置中显式开启 `translation.auto_rename_manual`，由后台监视器自动把新译文附件标题改为 `CN`，文件名改为“英文原文件名的全文翻译.pdf”。首次启动只记录历史基线，不批量修改旧译文。两种模式都不修改 PDF2zh 插件源码或 PDF 内容。
+译文命名在用户配置中统一设置；未配置时保持当前默认行为：
+
+```toml
+[translation]
+attachment_title = "CN"
+filename_template = "{source_stem}的全文翻译.pdf"
+```
+
+`filename_template` 必须包含且只支持 `{source_stem}` 变量，并渲染为单个 `.pdf` 文件名。用户仍可在 Zotero 中手动提交单篇翻译。默认可通过 maintenance toolset 的 plan/apply 工具事后重命名；也可显式开启 `translation.auto_rename_manual`，由后台监视器按上述配置自动重命名新译文。首次启动只记录历史基线，不批量修改旧译文。旧标题 `CN` 继续被识别，避免改配置后重复导入。两种模式都不修改 PDF2zh 插件源码或 PDF 内容。
 
 远程 WebDAV 和 PDF2zh Server 默认必须使用 HTTPS；同机 PDF2zh Server 仍可使用 localhost HTTP。doctor 只做无写入检查，正式批处理会先创建并删除一个临时 WebDAV 探针。
 

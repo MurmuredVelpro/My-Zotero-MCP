@@ -268,6 +268,78 @@ class PDF2ZHClientTests(unittest.TestCase):
         self.assertTrue(any("/translatedFile/" in call[1] for call in session.calls))
         self.assertFalse(any("server/translated" in call[1] for call in session.calls))
 
+    def test_custom_naming_controls_downloaded_filename(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "Dudnyk et al - 2024.pdf"
+            source.write_bytes(b"%PDF-1.4 source")
+            client = zotero_translate.PDF2ZHClient(
+                session=FakePDF2ZHSession(),
+                output_dir=Path(tmp) / "output",
+                naming=zotero_translate.TranslationNaming(
+                    attachment_title="Chinese",
+                    filename_template="{source_stem} (Chinese).pdf",
+                ),
+            )
+            output = client.translate(settings(), "ABCD1234", "EFGH5678", source, 7, 13)
+        self.assertEqual(output.name, "Dudnyk et al - 2024 (Chinese).pdf")
+
+
+class TranslationNamingTests(unittest.TestCase):
+    def test_missing_config_uses_current_defaults(self):
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            mock.patch.dict(
+                os.environ,
+                {
+                    zotero_translate.zotero_runtime.CONFIG_FILE_ENV: str(
+                        Path(tmp) / "missing.toml"
+                    )
+                },
+            ),
+        ):
+            naming = zotero_translate.load_translation_naming()
+        self.assertEqual(naming.attachment_title, "CN")
+        self.assertEqual(
+            naming.filename_for("English paper"), "English paper的全文翻译.pdf"
+        )
+
+    def test_loads_custom_naming_from_translation_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / "config.toml"
+            config.write_text(
+                "[translation]\n"
+                'attachment_title = "Chinese"\n'
+                'filename_template = "{source_stem} (Chinese).pdf"\n',
+                encoding="utf-8",
+            )
+            with mock.patch.dict(
+                os.environ,
+                {zotero_translate.zotero_runtime.CONFIG_FILE_ENV: str(config)},
+            ):
+                naming = zotero_translate.load_translation_naming()
+        self.assertEqual(naming.attachment_title, "Chinese")
+        self.assertEqual(
+            naming.filename_for("English paper"), "English paper (Chinese).pdf"
+        )
+
+    def test_rejects_invalid_titles_and_filename_templates(self):
+        invalid = [
+            ("", "{source_stem}.pdf"),
+            ("CN", "translation.pdf"),
+            ("CN", "{unknown}.pdf"),
+            ("CN", "{source_stem!r}.pdf"),
+            ("CN", "{source_stem:>20}.pdf"),
+            ("CN", "../{source_stem}.pdf"),
+            ("CN", "folder\\{source_stem}.pdf"),
+            ("CN", "{source_stem}.txt"),
+        ]
+        for title, template in invalid:
+            with (
+                self.subTest(title=title, template=template),
+                self.assertRaises(zotero_translate.TranslationError),
+            ):
+                zotero_translate.TranslationNaming(title, template)
+
 
 class FakeRenameZotero:
     PARENT_KEY = "ABCD1234"
@@ -373,7 +445,10 @@ class ManualTranslationRenameTests(unittest.TestCase):
             zotero = FakeRenameZotero(Path(tmp))
             api = FakeRenameAPI(zotero)
             result = zotero_translate.plan_manual_translation_renames(
-                [zotero.PARENT_KEY], zotero=zotero, api=api
+                [zotero.PARENT_KEY],
+                zotero=zotero,
+                api=api,
+                naming=zotero_translate.DEFAULT_TRANSLATION_NAMING,
             )
         row = result["results"][0]
         self.assertEqual(result["rename"], 1)
@@ -386,7 +461,10 @@ class ManualTranslationRenameTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             zotero = FakeRenameZotero(Path(tmp), duplicate=True)
             result = zotero_translate.plan_manual_translation_renames(
-                [zotero.PARENT_KEY], zotero=zotero, api=FakeRenameAPI(zotero)
+                [zotero.PARENT_KEY],
+                zotero=zotero,
+                api=FakeRenameAPI(zotero),
+                naming=zotero_translate.DEFAULT_TRANSLATION_NAMING,
             )
         self.assertEqual(result["blocked"], 1)
         self.assertEqual(
@@ -398,9 +476,28 @@ class ManualTranslationRenameTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             zotero = FakeRenameZotero(Path(tmp), conflict=True)
             result = zotero_translate.plan_manual_translation_renames(
-                [zotero.PARENT_KEY], zotero=zotero, api=FakeRenameAPI(zotero)
+                [zotero.PARENT_KEY],
+                zotero=zotero,
+                api=FakeRenameAPI(zotero),
+                naming=zotero_translate.DEFAULT_TRANSLATION_NAMING,
             )
         self.assertEqual(result["results"][0]["blockers"], ["target_filename_exists"])
+
+    def test_plan_uses_custom_title_and_filename(self):
+        naming = zotero_translate.TranslationNaming(
+            "Chinese", "{source_stem} (Chinese).pdf"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            zotero = FakeRenameZotero(Path(tmp))
+            result = zotero_translate.plan_manual_translation_renames(
+                [zotero.PARENT_KEY],
+                zotero=zotero,
+                api=FakeRenameAPI(zotero),
+                naming=naming,
+            )
+        row = result["results"][0]
+        self.assertEqual(row["new_title"], "Chinese")
+        self.assertEqual(row["new_filename"], "English paper (Chinese).pdf")
 
     def test_apply_requires_exact_keys_and_versioned_patch(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -412,11 +509,14 @@ class ManualTranslationRenameTests(unittest.TestCase):
                         "parent_item_key": zotero.PARENT_KEY,
                         "source_attachment_key": zotero.SOURCE_KEY,
                         "translation_attachment_key": zotero.TRANSLATION_KEY,
+                        "new_title": "CN",
+                        "new_filename": "English paper的全文翻译.pdf",
                     }
                 ],
                 True,
                 zotero=zotero,
                 api=api,
+                naming=zotero_translate.DEFAULT_TRANSLATION_NAMING,
             )
         self.assertEqual(result["renamed"], 1)
         method, path, kwargs = api.requests[0]
@@ -441,11 +541,38 @@ class ManualTranslationRenameTests(unittest.TestCase):
                             "parent_item_key": zotero.PARENT_KEY,
                             "source_attachment_key": zotero.SOURCE_KEY,
                             "translation_attachment_key": zotero.TRANSLATION_KEY,
+                            "new_title": "CN",
+                            "new_filename": "English paper的全文翻译.pdf",
                         }
                     ],
                     True,
                     zotero=zotero,
                     api=api,
+                    naming=zotero_translate.DEFAULT_TRANSLATION_NAMING,
+                )
+
+    def test_apply_rejects_naming_changed_since_plan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            zotero = FakeRenameZotero(Path(tmp))
+            with self.assertRaisesRegex(
+                zotero_translate.TranslationError, "new_title changed.*run plan again"
+            ):
+                zotero_translate.apply_manual_translation_renames(
+                    [
+                        {
+                            "parent_item_key": zotero.PARENT_KEY,
+                            "source_attachment_key": zotero.SOURCE_KEY,
+                            "translation_attachment_key": zotero.TRANSLATION_KEY,
+                            "new_title": "CN",
+                            "new_filename": "English paper的全文翻译.pdf",
+                        }
+                    ],
+                    True,
+                    zotero=zotero,
+                    api=FakeRenameAPI(zotero),
+                    naming=zotero_translate.TranslationNaming(
+                        "Chinese", "{source_stem} (Chinese).pdf"
+                    ),
                 )
 
 
@@ -645,6 +772,27 @@ class FakeAttachments:
 
 
 class WorkerTests(unittest.TestCase):
+    def test_default_clients_share_one_naming_snapshot(self):
+        naming = zotero_translate.TranslationNaming(
+            "Chinese", "{source_stem} (Chinese).pdf"
+        )
+        store = mock.Mock()
+        with (
+            mock.patch.object(
+                zotero_translate, "load_translation_naming", return_value=naming
+            ),
+            mock.patch.object(zotero_translate, "ZoteroClient") as zotero_client,
+            mock.patch.object(zotero_translate, "PDF2ZHClient") as pdf2zh_client,
+            mock.patch.object(
+                zotero_translate, "ZoteroAttachmentClient"
+            ) as attachment_client,
+        ):
+            worker = zotero_translate.TranslationWorker(store)
+        zotero_client.assert_called_once_with(naming=naming)
+        pdf2zh_client.assert_called_once_with(naming=naming)
+        attachment_client.assert_called_once_with(naming=naming)
+        self.assertIs(worker.naming, naming)
+
     def test_translation_then_import_updates_queue(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -692,6 +840,35 @@ class WorkerTests(unittest.TestCase):
             ):
                 worker.run_batch(7, 13, 1)
         self.assertEqual(server.translate_calls, 0)
+
+    def test_existing_output_is_renamed_to_current_template_before_import(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source.pdf"
+            source.write_bytes(b"%PDF-1.4 source")
+            output = root / "old-name.pdf"
+            output.write_bytes(b"%PDF-1.4 translated")
+            store = zotero_translate.QueueStore(root / "queue.csv")
+            store.write([pending_row(str(output))])
+            attachments = FakeAttachments()
+            worker = zotero_translate.TranslationWorker(
+                store,
+                zotero=FakeZotero(source),
+                server=FakeServer(root / "unused.pdf"),
+                attachments=attachments,
+                naming=zotero_translate.TranslationNaming(
+                    "Chinese", "{source_stem} (Chinese).pdf"
+                ),
+            )
+            with mock.patch.object(
+                zotero_translate, "load_pdf2zh_settings", return_value=settings()
+            ):
+                worker.run_batch(7, 13, 1)
+            row = store.read()[0]
+        imported = attachments.imports[0][2]
+        self.assertEqual(imported.name, "source (Chinese).pdf")
+        self.assertEqual(Path(row["output_pdf"]).name, "source (Chinese).pdf")
+        self.assertFalse(output.exists())
 
     def test_existing_cn_finishes_without_translation_or_import(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -856,11 +1033,12 @@ class AttachmentTests(unittest.TestCase):
     def tearDown(self):
         self.temp_dir.cleanup()
 
-    def make_client(self, *, api=None, session=None, environ=None):
+    def make_client(self, *, api=None, session=None, environ=None, naming=None):
         return zotero_translate.ZoteroAttachmentClient(
             session=session or FakeWebDAVSession(),
             api=api or FakeWebAPI(),
             environ=self.environ if environ is None else environ,
+            naming=naming,
         )
 
     def test_preflight_checks_web_api_and_webdav(self):
@@ -929,6 +1107,74 @@ class AttachmentTests(unittest.TestCase):
         self.assertIsNone(api.payload)
         self.assertEqual(session.calls, [])
 
+    def test_custom_naming_still_preserves_legacy_cn_attachment(self):
+        existing = {
+            "key": "OLDAT123",
+            "data": {
+                "key": "OLDAT123",
+                "itemType": "attachment",
+                "title": "CN",
+                "contentType": "application/pdf",
+                "filename": "old.pdf",
+            },
+        }
+        api = FakeWebAPI(children=[existing])
+        result = self.make_client(
+            api=api,
+            naming=zotero_translate.TranslationNaming(
+                "Chinese", "{source_stem} (Chinese).pdf"
+            ),
+        ).import_pdf(api.USER_ID, api.PARENT_KEY, self.pdf)
+        self.assertTrue(result["already_present"])
+        self.assertIsNone(api.payload)
+
+    def test_multiple_recognized_translation_attachments_block_import(self):
+        children = [
+            {
+                "key": "OLDAT123",
+                "data": {
+                    "key": "OLDAT123",
+                    "itemType": "attachment",
+                    "title": "CN",
+                    "contentType": "application/pdf",
+                    "filename": "old.pdf",
+                },
+            },
+            {
+                "key": "NEWAT123",
+                "data": {
+                    "key": "NEWAT123",
+                    "itemType": "attachment",
+                    "title": "Chinese",
+                    "contentType": "application/pdf",
+                    "filename": "new.pdf",
+                },
+            },
+        ]
+        api = FakeWebAPI(children=children)
+        with self.assertRaisesRegex(
+            zotero_translate.TranslationError,
+            "multiple existing translation attachments",
+        ):
+            self.make_client(
+                api=api,
+                naming=zotero_translate.TranslationNaming(
+                    "Chinese", "{source_stem} (Chinese).pdf"
+                ),
+            ).import_pdf(api.USER_ID, api.PARENT_KEY, self.pdf)
+        self.assertIsNone(api.payload)
+
+    def test_import_uses_custom_attachment_title(self):
+        api = FakeWebAPI()
+        result = self.make_client(
+            api=api,
+            naming=zotero_translate.TranslationNaming(
+                "Chinese", "{source_stem} (Chinese).pdf"
+            ),
+        ).import_pdf(api.USER_ID, api.PARENT_KEY, self.pdf)
+        self.assertEqual(api.payload["title"], "Chinese")
+        self.assertEqual(result["title"], "Chinese")
+
     def test_matching_cn_attachment_refreshes_webdav_after_interruption(self):
         md5_hex = hashlib.md5(self.pdf.read_bytes()).hexdigest()
         mtime_ms = int(self.pdf.stat().st_mtime * 1000)
@@ -973,6 +1219,9 @@ class DoctorTests(unittest.TestCase):
         server = mock.Mock()
         server.health.return_value = "http://localhost:8890"
         attachments = mock.Mock()
+        naming = zotero_translate.TranslationNaming(
+            "Chinese", "{source_stem} (Chinese).pdf"
+        )
         attachments.configuration_status.return_value = {
             "configured": True,
             "source": "private.json",
@@ -981,6 +1230,9 @@ class DoctorTests(unittest.TestCase):
         with (
             mock.patch.object(
                 zotero_translate, "load_pdf2zh_settings", return_value=settings()
+            ),
+            mock.patch.object(
+                zotero_translate, "load_translation_naming", return_value=naming
             ),
             mock.patch.object(zotero_translate, "PDF2ZHClient", return_value=server),
             mock.patch.object(
@@ -996,6 +1248,13 @@ class DoctorTests(unittest.TestCase):
         attachments.preflight.assert_called_once_with(verify_write=False)
         self.assertTrue(result["webdav"]["reachable"])
         self.assertFalse(result["webdav"]["write_verified"])
+        self.assertEqual(
+            result["naming"],
+            {
+                "attachment_title": "Chinese",
+                "filename_template": "{source_stem} (Chinese).pdf",
+            },
+        )
         rendered = json.dumps(result)
         self.assertNotIn("secret-key", rendered)
         self.assertNotIn("sample_item", rendered)

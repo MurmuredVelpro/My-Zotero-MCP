@@ -21,6 +21,8 @@ class SetupTests(unittest.TestCase):
         self.assertIn("[mineru]", value)
         self.assertIn("[qmd]", value)
         self.assertIn("[translation]", value)
+        self.assertIn('attachment_title = "CN"', value)
+        self.assertIn('filename_template = "{source_stem}的全文翻译.pdf"', value)
         self.assertIn("auto_rename_manual = false", value)
         self.assertNotIn("token", value.casefold())
         self.assertNotIn("api_key", value.casefold())

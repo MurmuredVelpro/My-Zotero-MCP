@@ -311,6 +311,8 @@ def translation_status(profile: str) -> dict[str, Any]:
             "service": pdf2zh["service"],
             "model": pdf2zh["model"],
             "webdav_source": value["webdav"]["source"],
+            "attachment_title": value["naming"]["attachment_title"],
+            "filename_template": value["naming"]["filename_template"],
         },
     )
 
@@ -483,6 +485,8 @@ def render_user_config(
             f"collection = {toml_string(qmd_collection)}",
             "",
             "[translation]",
+            f"attachment_title = {toml_string(zotero_translate.DEFAULT_TRANSLATION_ATTACHMENT_TITLE)}",
+            f"filename_template = {toml_string(zotero_translate.DEFAULT_TRANSLATION_FILENAME_TEMPLATE)}",
             "auto_rename_manual = false",
             "rename_poll_seconds = 30",
             "",

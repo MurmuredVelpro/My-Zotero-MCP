@@ -25,6 +25,7 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from string import Formatter
 from typing import Any
 from urllib.parse import quote, urlsplit, urlunsplit
 
@@ -42,7 +43,9 @@ QUEUE_FIELDS = (
     "last_error",
 )
 VALID_STATUSES = {"pending", "translating", "importing", "done", "failed"}
-CN_TITLE = "CN"
+DEFAULT_TRANSLATION_ATTACHMENT_TITLE = "CN"
+DEFAULT_TRANSLATION_FILENAME_TEMPLATE = "{source_stem}的全文翻译.pdf"
+CN_TITLE = DEFAULT_TRANSLATION_ATTACHMENT_TITLE
 PDF2ZH_TRANSLATION_FILENAME_RE = re.compile(
     r"\.zh(?:[-_]?cn)?\.(?:mono|dual)\.pdf$", re.IGNORECASE
 )
@@ -85,6 +88,91 @@ REQUEST_PREFS = (
 
 class TranslationError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class TranslationNaming:
+    attachment_title: str = DEFAULT_TRANSLATION_ATTACHMENT_TITLE
+    filename_template: str = DEFAULT_TRANSLATION_FILENAME_TEMPLATE
+
+    def __post_init__(self) -> None:
+        title = str(self.attachment_title).strip()
+        template = str(self.filename_template).strip()
+        if not title:
+            raise TranslationError("translation attachment title must not be empty")
+        try:
+            parsed = list(Formatter().parse(template))
+        except ValueError as exc:
+            raise TranslationError(
+                f"invalid translation filename template: {exc}"
+            ) from exc
+        found_source_stem = False
+        for _, field_name, format_spec, conversion in parsed:
+            if field_name is None:
+                continue
+            if field_name != "source_stem":
+                raise TranslationError(
+                    "translation filename template only supports {source_stem}"
+                )
+            if format_spec or conversion:
+                raise TranslationError(
+                    "translation filename template does not support format specs or conversions"
+                )
+            found_source_stem = True
+        if not found_source_stem:
+            raise TranslationError(
+                "translation filename template must contain {source_stem}"
+            )
+        object.__setattr__(self, "attachment_title", title)
+        object.__setattr__(self, "filename_template", template)
+        self.filename_for("source")
+
+    def filename_for(self, source_stem: str) -> str:
+        stem = str(source_stem).strip()
+        if not stem:
+            raise TranslationError("translation source filename stem must not be empty")
+        filename = self.filename_template.format(source_stem=stem)
+        if (
+            not filename
+            or filename in {".", ".."}
+            or "/" in filename
+            or "\\" in filename
+            or "\x00" in filename
+            or Path(filename).name != filename
+        ):
+            raise TranslationError(
+                "translation filename template must render one PDF filename"
+            )
+        if not filename.casefold().endswith(".pdf"):
+            raise TranslationError(
+                "translation filename template must render a .pdf filename"
+            )
+        return filename
+
+    def matches_attachment_title(self, title: str) -> bool:
+        return title.strip() in {
+            self.attachment_title,
+            DEFAULT_TRANSLATION_ATTACHMENT_TITLE,
+        }
+
+
+DEFAULT_TRANSLATION_NAMING = TranslationNaming()
+
+
+def load_translation_naming() -> TranslationNaming:
+    try:
+        return TranslationNaming(
+            attachment_title=zotero_runtime.config_string(
+                "translation", "attachment_title"
+            )
+            or DEFAULT_TRANSLATION_ATTACHMENT_TITLE,
+            filename_template=zotero_runtime.config_string(
+                "translation", "filename_template"
+            )
+            or DEFAULT_TRANSLATION_FILENAME_TEMPLATE,
+        )
+    except zotero_runtime.RuntimeConfigError as exc:
+        raise TranslationError(str(exc)) from exc
 
 
 def _insecure_http_allowed(environ: Mapping[str, str] | None = None) -> bool:
@@ -206,12 +294,14 @@ def item_title(item: dict[str, Any]) -> str:
     return str((item.get("data") or {}).get("title") or "").strip()
 
 
-def is_cn_pdf_attachment(item: dict[str, Any]) -> bool:
+def is_cn_pdf_attachment(
+    item: dict[str, Any], naming: TranslationNaming | None = None
+) -> bool:
     data = item.get("data") or {}
     title = str(data.get("title") or "").strip()
     filename = str(data.get("filename") or "")
     content_type = str(data.get("contentType") or "")
-    return title == CN_TITLE and (
+    return (naming or DEFAULT_TRANSLATION_NAMING).matches_attachment_title(title) and (
         content_type == "application/pdf" or filename.lower().endswith(".pdf")
     )
 
@@ -549,9 +639,11 @@ class PDF2ZHClient:
         self,
         session: requests.Session | None = None,
         output_dir: Path | None = None,
+        naming: TranslationNaming | None = None,
     ) -> None:
         self.session = session or requests.Session()
         self.output_dir = output_dir or default_output_dir()
+        self.naming = naming or DEFAULT_TRANSLATION_NAMING
         self.base_url = ""
 
     def health(self, settings: PDF2ZHSettings) -> str:
@@ -631,7 +723,7 @@ class PDF2ZHClient:
 
         item_dir = self.output_dir / f"{parent_key}_{source_key}"
         item_dir.mkdir(parents=True, exist_ok=True)
-        output = item_dir / f"{source_pdf.stem}的全文翻译.pdf"
+        output = item_dir / self.naming.filename_for(source_pdf.stem)
         temporary = output.with_name(f".{output.name}.{os.getpid()}.tmp")
         try:
             download = self.session.get(
@@ -654,6 +746,9 @@ class PDF2ZHClient:
 
 
 class ZoteroClient:
+    def __init__(self, naming: TranslationNaming | None = None) -> None:
+        self.naming = naming or DEFAULT_TRANSLATION_NAMING
+
     def parent_item(self, key: str) -> dict[str, Any]:
         item = zotero_local.get_item(key)
         parent = zotero_local.resolve_top_level_item(item)
@@ -669,7 +764,7 @@ class ZoteroClient:
             (
                 child
                 for child in self.children(parent_key)
-                if is_cn_pdf_attachment(child)
+                if is_cn_pdf_attachment(child, self.naming)
             ),
             None,
         )
@@ -727,6 +822,7 @@ def _translation_rename_records(
     *,
     zotero: ZoteroClient,
     api: Any,
+    naming: TranslationNaming,
 ) -> tuple[int, list[dict[str, Any]]]:
     if not isinstance(item_keys, list) or not 1 <= len(item_keys) <= 50:
         raise TranslationError("item_keys must contain between 1 and 50 Zotero keys")
@@ -757,11 +853,12 @@ def _translation_rename_records(
             raise TranslationError(
                 f"invalid English source attachment for {parent_key}"
             )
-        target_filename = f"{Path(source_filename).stem}的全文翻译.pdf"
+        target_filename = naming.filename_for(Path(source_filename).stem)
         candidates = [
             child
             for child in zotero.children(parent_key)
-            if is_cn_pdf_attachment(child) or is_pdf2zh_translation_attachment(child)
+            if is_cn_pdf_attachment(child, naming)
+            or is_pdf2zh_translation_attachment(child)
         ]
         row: dict[str, Any] = {
             "requested_key": requested_key,
@@ -769,7 +866,7 @@ def _translation_rename_records(
             "paper_title": item_title(parent),
             "source_attachment_key": source_key,
             "source_filename": source_filename,
-            "new_title": CN_TITLE,
+            "new_title": naming.attachment_title,
             "new_filename": target_filename,
             "status": "blocked",
             "blockers": [],
@@ -833,7 +930,7 @@ def _translation_rename_records(
         row["blockers"] = []
         row["status"] = (
             "unchanged"
-            if old_title == CN_TITLE and old_filename == target_filename
+            if old_title == naming.attachment_title and old_filename == target_filename
             else "rename"
         )
         results.append(row)
@@ -845,9 +942,14 @@ def plan_manual_translation_renames(
     *,
     zotero: ZoteroClient | None = None,
     api: Any = zotero_web_api,
+    naming: TranslationNaming | None = None,
 ) -> dict[str, Any]:
+    selected_naming = naming or load_translation_naming()
     user_id, results = _translation_rename_records(
-        item_keys, zotero=zotero or ZoteroClient(), api=api
+        item_keys,
+        zotero=zotero or ZoteroClient(naming=selected_naming),
+        api=api,
+        naming=selected_naming,
     )
     return {
         "user_id": user_id,
@@ -865,6 +967,7 @@ def apply_manual_translation_renames(
     *,
     zotero: ZoteroClient | None = None,
     api: Any = zotero_web_api,
+    naming: TranslationNaming | None = None,
 ) -> dict[str, Any]:
     if confirm is not True:
         raise TranslationError("confirm=true is required for attachment renaming")
@@ -874,15 +977,20 @@ def apply_manual_translation_renames(
         "parent_item_key",
         "source_attachment_key",
         "translation_attachment_key",
+        "new_title",
+        "new_filename",
     }
     requested = []
     for position, record in enumerate(items, start=1):
         if not isinstance(record, dict) or not required.issubset(record):
-            raise TranslationError(f"item {position} is missing exact attachment keys")
+            raise TranslationError(f"item {position} is missing reviewed rename fields")
         requested.append(str(record["parent_item_key"]).strip().upper())
 
-    client = zotero or ZoteroClient()
-    user_id, plan = _translation_rename_records(requested, zotero=client, api=api)
+    selected_naming = naming or load_translation_naming()
+    client = zotero or ZoteroClient(naming=selected_naming)
+    user_id, plan = _translation_rename_records(
+        requested, zotero=client, api=api, naming=selected_naming
+    )
     by_parent = {row["parent_item_key"]: row for row in plan}
     results = []
     for record in items:
@@ -895,6 +1003,11 @@ def apply_manual_translation_renames(
                 raise TranslationError(
                     f"{field} changed for {parent_key}; run plan again"
                 )
+        for field in ("new_title", "new_filename"):
+            if str(record[field]) != current[field]:
+                raise TranslationError(
+                    f"{field} changed for {parent_key}; run plan again"
+                )
         if current["status"] == "unchanged":
             results.append({**current, "status": "unchanged"})
             continue
@@ -903,7 +1016,10 @@ def apply_manual_translation_renames(
         response = api.web_api_request(
             "PATCH",
             f"users/{user_id}/items/{attachment_key}",
-            payload={"title": CN_TITLE, "filename": current["new_filename"]},
+            payload={
+                "title": current["new_title"],
+                "filename": current["new_filename"],
+            },
             headers={"If-Unmodified-Since-Version": str(current["version"])},
             timeout=30.0,
         )
@@ -917,7 +1033,7 @@ def apply_manual_translation_renames(
         verified_data = verified.get("data") or {}
         if (
             str(verified_data.get("parentItem") or "") != parent_key
-            or str(verified_data.get("title") or "") != CN_TITLE
+            or str(verified_data.get("title") or "") != current["new_title"]
             or str(verified_data.get("filename") or "") != current["new_filename"]
         ):
             raise TranslationError(
@@ -994,16 +1110,20 @@ def _auto_rename_attachment(
     *,
     zotero: ZoteroClient | None = None,
     api: Any = zotero_web_api,
+    naming: TranslationNaming | None = None,
 ) -> dict[str, Any]:
+    selected_naming = naming or load_translation_naming()
     attachment = zotero_local.get_item(attachment_key)
-    if is_cn_pdf_attachment(attachment):
+    if is_cn_pdf_attachment(attachment, selected_naming):
         return {"status": "already_named", "attachment_key": attachment_key}
     if not is_pdf2zh_translation_attachment(attachment):
         return {"status": "ignored", "attachment_key": attachment_key}
     parent_key = str((attachment.get("data") or {}).get("parentItem") or "").upper()
     if not ZOTERO_KEY_RE.fullmatch(parent_key):
         return {"status": "blocked", "blockers": ["invalid_parent_item_key"]}
-    plan = plan_manual_translation_renames([parent_key], zotero=zotero, api=api)
+    plan = plan_manual_translation_renames(
+        [parent_key], zotero=zotero, api=api, naming=selected_naming
+    )
     row = plan["results"][0]
     if row["status"] == "blocked":
         return row
@@ -1013,11 +1133,14 @@ def _auto_rename_attachment(
                 "parent_item_key": row["parent_item_key"],
                 "source_attachment_key": row["source_attachment_key"],
                 "translation_attachment_key": row["translation_attachment_key"],
+                "new_title": row["new_title"],
+                "new_filename": row["new_filename"],
             }
         ],
         True,
         zotero=zotero,
         api=api,
+        naming=selected_naming,
     )
     return result["results"][0]
 
@@ -1327,10 +1450,12 @@ class ZoteroAttachmentClient:
         session: requests.Session | None = None,
         api: Any = zotero_web_api,
         environ: Mapping[str, str] | None = None,
+        naming: TranslationNaming | None = None,
     ) -> None:
         self.session = session or requests.Session()
         self.api = api
         self.environ = environ
+        self.naming = naming or DEFAULT_TRANSLATION_NAMING
 
     def configuration_status(self) -> dict[str, Any]:
         _, _, _, timeout, source = load_webdav_config(self.environ)
@@ -1461,12 +1586,13 @@ class ZoteroAttachmentClient:
         filename: str,
         md5_hex: str,
         mtime_ms: int,
+        expected_title: str,
     ) -> int:
         data = item.get("data") or {}
         checks = {
             "key": item_key(item) == attachment_key,
             "parentItem": str(data.get("parentItem") or "") == parent_key,
-            "title": str(data.get("title") or "") == CN_TITLE,
+            "title": str(data.get("title") or "") == expected_title,
             "linkMode": str(data.get("linkMode") or "") == "imported_file",
             "contentType": str(data.get("contentType") or "") == "application/pdf",
             "filename": str(data.get("filename") or "") == filename,
@@ -1587,18 +1713,22 @@ class ZoteroAttachmentClient:
             raise TranslationError(f"Zotero parent is not top-level: {parent_key}")
         md5_hex = self._file_md5(file_path)
         mtime_ms = int(file_path.stat().st_mtime * 1000)
-        existing = next(
-            (
-                child
-                for child in self._cloud_children(user_id, parent_key)
-                if is_cn_pdf_attachment(child)
-            ),
-            None,
-        )
+        existing_matches = [
+            child
+            for child in self._cloud_children(user_id, parent_key)
+            if is_cn_pdf_attachment(child, self.naming)
+        ]
+        if len(existing_matches) > 1:
+            raise TranslationError(
+                f"multiple existing translation attachments for {parent_key}"
+            )
+        existing = existing_matches[0] if existing_matches else None
         if existing:
             existing_key = item_key(existing)
             if not ZOTERO_KEY_RE.fullmatch(existing_key):
-                raise TranslationError("existing CN attachment has no valid Zotero key")
+                raise TranslationError(
+                    "existing translation attachment has no valid Zotero key"
+                )
             refreshed = False
             if self._same_file(existing, parent_key, file_path.name, md5_hex, mtime_ms):
                 self._upload_webdav(existing_key, file_path, md5_hex, mtime_ms)
@@ -1613,7 +1743,7 @@ class ZoteroAttachmentClient:
         payload = {
             "itemType": "attachment",
             "linkMode": "imported_file",
-            "title": CN_TITLE,
+            "title": self.naming.attachment_title,
             "parentItem": parent_key,
             "contentType": "application/pdf",
             "charset": "",
@@ -1637,12 +1767,24 @@ class ZoteroAttachmentClient:
             attachment_key, version = self._created_attachment(creation)
             created = self.api.web_api_get_item(user_id, attachment_key)
             version = self._validate_attachment(
-                created, attachment_key, parent_key, file_path.name, md5_hex, mtime_ms
+                created,
+                attachment_key,
+                parent_key,
+                file_path.name,
+                md5_hex,
+                mtime_ms,
+                self.naming.attachment_title,
             )
             self._upload_webdav(attachment_key, file_path, md5_hex, mtime_ms)
             verified = self.api.web_api_get_item(user_id, attachment_key)
             self._validate_attachment(
-                verified, attachment_key, parent_key, file_path.name, md5_hex, mtime_ms
+                verified,
+                attachment_key,
+                parent_key,
+                file_path.name,
+                md5_hex,
+                mtime_ms,
+                self.naming.attachment_title,
             )
         except Exception as exc:
             if attachment_key:
@@ -1659,7 +1801,7 @@ class ZoteroAttachmentClient:
             "ok": True,
             "already_present": False,
             "attachment_key": attachment_key,
-            "title": CN_TITLE,
+            "title": self.naming.attachment_title,
         }
 
 
@@ -1671,11 +1813,14 @@ class TranslationWorker:
         server: PDF2ZHClient | None = None,
         attachments: ZoteroAttachmentClient | None = None,
         prefs_path: Path | None = None,
+        naming: TranslationNaming | None = None,
     ) -> None:
+        selected_naming = naming or load_translation_naming()
         self.store = store
-        self.zotero = zotero or ZoteroClient()
-        self.server = server or PDF2ZHClient()
-        self.attachments = attachments or ZoteroAttachmentClient()
+        self.naming = selected_naming
+        self.zotero = zotero or ZoteroClient(naming=selected_naming)
+        self.server = server or PDF2ZHClient(naming=selected_naming)
+        self.attachments = attachments or ZoteroAttachmentClient(naming=selected_naming)
         self.prefs_path = prefs_path
 
     def enqueue(self, keys: list[str]) -> dict[str, int]:
@@ -1855,6 +2000,20 @@ class TranslationWorker:
                 settings, parent_key, source_key, source_pdf, qps, pool_size
             )
             row["output_pdf"] = str(output)
+        target = output.with_name(self.naming.filename_for(source_pdf.stem))
+        if target != output:
+            if target.exists():
+                raise TranslationError(
+                    f"configured translation output filename already exists: {target}"
+                )
+            try:
+                os.replace(output, target)
+            except OSError as exc:
+                raise TranslationError(
+                    f"cannot apply configured translation filename: {output} -> {target}: {exc}"
+                ) from exc
+            output = target
+        row["output_pdf"] = str(output)
         row["status"] = "importing"
         self.store.write(rows)
         self.attachments.import_pdf(user_id, parent_key, output)
@@ -1865,11 +2024,12 @@ class TranslationWorker:
 
 def doctor(prefs_path: Path | None = None) -> dict[str, Any]:
     settings = load_pdf2zh_settings(prefs_path)
-    server = PDF2ZHClient()
+    naming = load_translation_naming()
+    server = PDF2ZHClient(naming=naming)
     selected_url = server.health(settings)
     local = zotero_local.ping_status()
     local.pop("sample_item", None)
-    attachments = ZoteroAttachmentClient()
+    attachments = ZoteroAttachmentClient(naming=naming)
     attachments.preflight(verify_write=False)
     webdav = {
         **attachments.configuration_status(),
@@ -1881,6 +2041,10 @@ def doctor(prefs_path: Path | None = None) -> dict[str, Any]:
         "pdf2zh": {**settings.summary(), "selected_server_url": selected_url},
         "zotero_local_api": local,
         "webdav": webdav,
+        "naming": {
+            "attachment_title": naming.attachment_title,
+            "filename_template": naming.filename_template,
+        },
         "queue": str(default_queue_path()),
     }
 
