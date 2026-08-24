@@ -578,7 +578,7 @@ def tool_mineru_submit(arguments: dict[str, Any]) -> dict[str, Any]:
             return text_result(str(exc), True)
         status = workflow.tracked_result_status(item_key, str(attachment["key"]))
         if status == "stale":
-            tracked = workflow.todo_rows_by_key().get(item_key, {})
+            tracked = workflow.mineru_records_by_key().get(item_key, {})
             return text_result(
                 "Existing MinerU result is stale: "
                 f"parsed_attachment_key={tracked.get('parsed_attachment_key', '')}, "

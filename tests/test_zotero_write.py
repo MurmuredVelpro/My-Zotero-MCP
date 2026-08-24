@@ -83,6 +83,29 @@ class IdentifierTests(unittest.TestCase):
             ):
                 zotero_write.web_api_key()
 
+    def test_web_api_key_uses_secret_filename_by_default(self):
+        key_file = Path("/tmp/zotero_web_api_key.secret")
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch.object(
+                zotero_web_api.zotero_runtime,
+                "configured_path",
+                return_value=None,
+            ),
+            mock.patch.object(
+                zotero_web_api.zotero_runtime,
+                "default_secret_path",
+                return_value=key_file,
+            ) as default_path,
+            mock.patch.object(Path, "is_file", return_value=False),
+            self.assertRaisesRegex(
+                zotero_write.ZoteroWriteError,
+                "zotero_web_api_key\\.secret",
+            ),
+        ):
+            zotero_write.web_api_key()
+        default_path.assert_called_once_with("zotero_web_api_key.secret")
+
 
 class FakeResponse:
     def __init__(self, status_code, data=None, text="", headers=None):

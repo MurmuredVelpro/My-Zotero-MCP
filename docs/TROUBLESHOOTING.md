@@ -47,9 +47,10 @@ Create a personal-library write key, save it with `zotero-mcp setup save-secret 
 ## MinerU fails
 
 - Missing Token: follow [ACCOUNTS.md](ACCOUNTS.md#mineru).
-- Interrupted upload: retain the batch ID stored under `.jobs`; collect the existing batch instead of resubmitting.
+- Interrupted upload: retain the batch ID stored in `zotero_workflow.sqlite3`; collect the existing batch instead of resubmitting.
 - Stale result: the current Zotero PDF attachment key differs from the parsed key. Use `zotero-mineru` to replace it through the recoverable workflow.
 - Missing artifacts: `zotero-mineru verify <batch-id>` reports the exact missing or invalid file.
+- Existing result blocked as `untracked_existing`: do not resubmit it. Verify the current English attachment and run `zotero-mineru adopt-existing ITEMKEY --attachment-key ATTACHMENTKEY` as a read-only plan; add `--confirm` only after checking the result. The command writes only SQLite, resets `qmd_indexed` to false, and requires normal QMD indexing afterward.
 
 ## QMD fails
 
@@ -62,9 +63,11 @@ qmd collection show zotero-mineru
 
 Set `qmd.command` when QMD is not on `PATH`. Set `qmd.collection` when using a different collection name.
 
+If MinerU is current but SQLite reports `pending_index`, the local `full.md` is not enough to pass the gate. Run the normal QMD update/embed/verification path. If SQLite says `missing`, the index marker exists but QMD cannot read the document; investigate the collection path before reviewing it.
+
 ## SciVerse tools are absent
 
-Run `sciverse auth login` in the environment used by the SciVerse MCP server. Confirm `sciverse-mcp-server` or `npx` is available, regenerate the Codex blocks, then restart Codex.
+Run `zotero-mcp setup save-secret sciverse` through hidden terminal input. Confirm the private Token file is owned by the current user with mode `0600`, confirm `sciverse-mcp-server` or `npx` is available, regenerate the Codex blocks, then restart Codex.
 
 ## PDF2zh preferences are not found
 

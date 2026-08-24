@@ -9,21 +9,28 @@ from unittest import mock
 from zotero_mcp import mineru_client
 
 
-class FakeResponse:
-    def __init__(self, payload=None, status_code=200, content=b""):
-        self.payload = payload
-        self.status_code = status_code
-        self.content = content
-
-    def json(self):
-        return self.payload
-
-    def iter_content(self, chunk_size=1024):
-        del chunk_size
-        yield self.content
-
-
 class MinerUClientTests(unittest.TestCase):
+    class StreamingResponse:
+        def __init__(self, content, *, status_code=200, headers=None):
+            self.content = content
+            self.status_code = status_code
+            self.headers = headers or {"Content-Length": str(len(content))}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise RuntimeError(f"HTTP {self.status_code}")
+
+        def iter_content(self, chunk_size):
+            del chunk_size
+            yield self.content[:3]
+            yield self.content[3:]
+
     def mineru_zip(self, *, include_model=True):
         buffer = io.BytesIO()
         with zipfile.ZipFile(buffer, "w") as archive:
@@ -39,29 +46,63 @@ class MinerUClientTests(unittest.TestCase):
 
     def test_load_token_from_private_file(self):
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "token"
+            path = Path(tmp) / "mineru_api_token.secret"
             path.write_text("secret-token\n", encoding="utf-8")
             path.chmod(0o600)
             with mock.patch.dict(os.environ, {}, clear=True):
                 self.assertEqual(mineru_client.load_token(path), "secret-token")
 
+    def test_token_path_uses_secret_filename_by_default(self):
+        expected = Path("/tmp/mineru/mineru_api_token.secret")
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch.object(
+                mineru_client.zotero_runtime,
+                "configured_path",
+                return_value=None,
+            ),
+            mock.patch.object(
+                mineru_client,
+                "default_token_path",
+                return_value=expected,
+            ),
+        ):
+            self.assertEqual(mineru_client.token_path(), expected)
+
+    def test_default_token_path_uses_independent_xdg_directory(self):
+        with (
+            mock.patch.object(mineru_client.os, "name", "posix"),
+            mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": "/tmp/config"}, clear=True),
+        ):
+            self.assertEqual(
+                mineru_client.default_token_path(),
+                Path("/tmp/config/mineru/mineru_api_token.secret"),
+            )
+
     def test_submit_file_uses_batch_upload_contract(self):
         with tempfile.TemporaryDirectory() as tmp:
             pdf = Path(tmp) / "paper.pdf"
             pdf.write_bytes(b"%PDF-test")
-            post = FakeResponse(
-                {
-                    "code": 0,
-                    "msg": "ok",
-                    "data": {"batch_id": "B1", "file_urls": ["https://upload"]},
-                }
-            )
-            put = FakeResponse(status_code=200)
+            client = mock.MagicMock()
+            client.post.return_value = {
+                "code": 0,
+                "msg": "ok",
+                "data": {"batch_id": "B1", "file_urls": ["https://upload"]},
+            }
+            uploaded = {}
+
+            def capture_upload(_url, **kwargs):
+                uploaded["data"] = kwargs["data"].read()
+                return self.StreamingResponse(b"", status_code=200)
+
             with (
+                mock.patch.object(mineru_client, "ApiClient", return_value=client),
+                mock.patch.object(mineru_client, "load_token", return_value="token"),
                 mock.patch.object(
-                    mineru_client.requests, "post", return_value=post
-                ) as post_call,
-                mock.patch.object(mineru_client.requests, "put", return_value=put),
+                    mineru_client.requests,
+                    "put",
+                    side_effect=capture_upload,
+                ) as put,
             ):
                 result = mineru_client.submit_file(
                     pdf,
@@ -69,35 +110,63 @@ class MinerUClientTests(unittest.TestCase):
                     page_ranges="1-5",
                     token="token",
                 )
-            body = post_call.call_args.kwargs["json"]
+            body = client.post.call_args.kwargs["json"]
             self.assertEqual(body["model_version"], "vlm")
             self.assertEqual(body["language"], "en")
             self.assertEqual(body["files"][0]["data_id"], "ITEM1")
             self.assertEqual(body["files"][0]["page_ranges"], "1-5")
             self.assertEqual(result["batch_id"], "B1")
+            put.assert_called_once()
+            self.assertEqual(put.call_args.args[0], "https://upload")
+            self.assertEqual(uploaded["data"], b"%PDF-test")
 
     def test_request_upload_batch_supports_multiple_files(self):
-        post = FakeResponse(
-            {
-                "code": 0,
-                "msg": "ok",
-                "data": {
-                    "batch_id": "B2",
-                    "file_urls": ["https://upload/1", "https://upload/2"],
-                },
-            }
-        )
+        client = mock.MagicMock()
+        client.post.return_value = {
+            "code": 0,
+            "msg": "ok",
+            "data": {
+                "batch_id": "B2",
+                "file_urls": ["https://upload/1", "https://upload/2"],
+            },
+        }
         specs = [
             {"name": "one.pdf", "data_id": "ITEM1"},
             {"name": "two.pdf", "data_id": "ITEM2"},
         ]
-        with mock.patch.object(
-            mineru_client.requests, "post", return_value=post
-        ) as post_call:
+        with mock.patch.object(mineru_client, "ApiClient", return_value=client):
             result = mineru_client.request_upload_batch(specs, token="token")
         self.assertEqual(result["batch_id"], "B2")
         self.assertEqual(len(result["file_urls"]), 2)
-        self.assertEqual(post_call.call_args.kwargs["json"]["files"], specs)
+        self.assertEqual(client.post.call_args.kwargs["json"]["files"], specs)
+
+    def test_upload_rejects_http_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pdf = Path(tmp) / "paper.pdf"
+            pdf.write_bytes(b"%PDF-test")
+            with (
+                mock.patch.object(
+                    mineru_client.requests,
+                    "put",
+                    return_value=self.StreamingResponse(b"", status_code=500),
+                ),
+                self.assertRaisesRegex(mineru_client.MinerUError, "Upload PDF"),
+            ):
+                mineru_client.upload_file(pdf, "https://upload")
+
+    def test_get_batch_preserves_raw_data_id_contract(self):
+        client = mock.MagicMock()
+        client.get.return_value = {
+            "data": {
+                "extract_result": [
+                    {"data_id": "ITEM1", "file_name": "paper.pdf", "state": "done"}
+                ]
+            }
+        }
+        with mock.patch.object(mineru_client, "ApiClient", return_value=client):
+            result = mineru_client.get_batch("B1", token="token")
+        self.assertEqual(result["extract_result"][0]["data_id"], "ITEM1")
+        client.get.assert_called_once_with("/extract-results/batch/B1")
 
     def test_request_upload_batch_rejects_more_than_fifty_files(self):
         specs = [{"name": f"{index}.pdf"} for index in range(51)]
@@ -120,13 +189,18 @@ class MinerUClientTests(unittest.TestCase):
 
     def test_download_and_extract_reports_expected_files(self):
         with tempfile.TemporaryDirectory() as tmp:
-            response = FakeResponse(content=self.mineru_zip())
-            with mock.patch.object(
-                mineru_client.requests, "get", return_value=response
+            content = self.mineru_zip()
+            with (
+                mock.patch.object(
+                    mineru_client.requests,
+                    "get",
+                    return_value=self.StreamingResponse(content),
+                ) as get,
             ):
                 result = mineru_client.download_and_extract(
                     "https://example.test/result.zip", Path(tmp) / "result"
                 )
+            get.assert_called_once()
             self.assertTrue(Path(result["full_md"]).is_file())
             self.assertTrue(Path(result["content_list_json"]).is_file())
             self.assertTrue(Path(result["content_list_v2_json"]).is_file())
@@ -143,9 +217,13 @@ class MinerUClientTests(unittest.TestCase):
             output_dir = Path(tmp) / "result"
             output_dir.mkdir()
             (output_dir / "full.md").write_text("partial", encoding="utf-8")
-            response = FakeResponse(content=self.mineru_zip())
-            with mock.patch.object(
-                mineru_client.requests, "get", return_value=response
+            content = self.mineru_zip()
+            with (
+                mock.patch.object(
+                    mineru_client.requests,
+                    "get",
+                    return_value=self.StreamingResponse(content),
+                ),
             ):
                 mineru_client.download_and_extract(
                     "https://example.test/result.zip", output_dir
@@ -160,9 +238,13 @@ class MinerUClientTests(unittest.TestCase):
             output_dir = Path(tmp) / "result"
             output_dir.mkdir()
             (output_dir / "full.md").write_text("old partial", encoding="utf-8")
-            response = FakeResponse(content=self.mineru_zip(include_model=False))
+            content = self.mineru_zip(include_model=False)
             with (
-                mock.patch.object(mineru_client.requests, "get", return_value=response),
+                mock.patch.object(
+                    mineru_client.requests,
+                    "get",
+                    return_value=self.StreamingResponse(content),
+                ),
                 self.assertRaisesRegex(mineru_client.MinerUError, "incomplete"),
             ):
                 mineru_client.download_and_extract(
@@ -173,6 +255,22 @@ class MinerUClientTests(unittest.TestCase):
                 "old partial",
             )
             self.assertFalse((output_dir / "result.zip").exists())
+
+    def test_truncated_stream_is_rejected_before_install(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "result"
+            response = self.StreamingResponse(
+                self.mineru_zip(),
+                headers={"Content-Length": "999999"},
+            )
+            with (
+                mock.patch.object(mineru_client.requests, "get", return_value=response),
+                self.assertRaisesRegex(mineru_client.MinerUError, "incomplete"),
+            ):
+                mineru_client.download_and_extract(
+                    "https://example.test/result.zip", output_dir
+                )
+            self.assertFalse(output_dir.exists())
 
     def test_item_directory_name_is_zotero_key(self):
         item = {

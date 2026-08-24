@@ -5,6 +5,8 @@ import io
 import json
 import os
 import tempfile
+import threading
+import time
 import unittest
 import zipfile
 from datetime import UTC, datetime, timedelta
@@ -70,15 +72,51 @@ def settings() -> zotero_translate.PDF2ZHSettings:
     )
 
 
-def pending_row(output_pdf: str = "") -> dict[str, str]:
+def pending_row(
+    output_pdf: str = "",
+    *,
+    parent_key: str = "ABCD1234",
+    source_key: str = "EFGH5678",
+    status: str = "pending",
+    attempt_count: int = 0,
+    downloaded_at: str = "",
+    next_attempt_at: str = "",
+) -> dict[str, str]:
     return {
         "paper_title": "Paper",
-        "parent_item_key": "ABCD1234",
-        "source_attachment_key": "EFGH5678",
-        "status": "pending",
+        "parent_item_key": parent_key,
+        "source_attachment_key": source_key,
+        "status": status,
         "output_pdf": output_pdf,
         "last_error": "",
+        "attempt_count": str(attempt_count),
+        "downloaded_at": downloaded_at,
+        "next_attempt_at": next_attempt_at,
     }
+
+
+def run_worker(
+    worker,
+    *,
+    qps=7,
+    pool_size=13,
+    max_items=1,
+    paper_concurrency=1,
+    inter_item_delay=0,
+    retry_delay=0,
+    transient_retries=0,
+    dry_run=False,
+):
+    return worker.run_batch(
+        qps,
+        pool_size,
+        max_items,
+        paper_concurrency=paper_concurrency,
+        inter_item_delay=inter_item_delay,
+        retry_delay=retry_delay,
+        transient_retries=transient_retries,
+        dry_run=dry_run,
+    )
 
 
 class FakeResponse:
@@ -711,6 +749,9 @@ class QueueTests(unittest.TestCase):
                 "status": "pending",
                 "output_pdf": "",
                 "last_error": "",
+                "attempt_count": "0",
+                "downloaded_at": "",
+                "next_attempt_at": "",
             }
             with store.lock():
                 store.write([row])
@@ -731,11 +772,15 @@ class QueueTests(unittest.TestCase):
 
 
 class FakeZotero:
-    def __init__(self, source: Path, cn_present: bool = False) -> None:
+    def __init__(
+        self, source: Path | dict[str, Path], cn_present: bool = False
+    ) -> None:
         self.source = source
         self.cn_present = cn_present
 
     def source_pdf(self, parent_key, source_key):
+        if isinstance(self.source, dict):
+            return self.source[parent_key]
         return self.source
 
     def cn_attachment(self, parent_key):
@@ -769,6 +814,81 @@ class FakeAttachments:
 
     def import_pdf(self, user_id, parent_key, output):
         self.imports.append((user_id, parent_key, output))
+
+
+class ConcurrentTranslationState:
+    def __init__(
+        self, root: Path, delays=None, failures=None, barrier_count: int | None = None
+    ) -> None:
+        self.root = root
+        self.delays = delays or {}
+        self.failures = dict(failures or {})
+        self.barrier = threading.Barrier(barrier_count) if barrier_count else None
+        self.lock = threading.Lock()
+        self.active = 0
+        self.max_active = 0
+        self.instances = 0
+        self.calls = []
+        self.started = {}
+        self.finished = {}
+
+    def server(self):
+        with self.lock:
+            self.instances += 1
+        return ConcurrentFakeServer(self)
+
+
+class ConcurrentFakeServer:
+    def __init__(self, state: ConcurrentTranslationState) -> None:
+        self.state = state
+        self.base_url = ""
+
+    def translate(self, value, parent_key, source_key, source_pdf, qps, pool_size):
+        started = time.monotonic()
+        with self.state.lock:
+            self.state.active += 1
+            self.state.max_active = max(self.state.max_active, self.state.active)
+            self.state.calls.append((parent_key, qps, pool_size))
+            self.state.started.setdefault(parent_key, []).append(started)
+        try:
+            if self.state.barrier is not None:
+                self.state.barrier.wait(timeout=5)
+            time.sleep(self.state.delays.get(parent_key, 0))
+            with self.state.lock:
+                remaining = self.state.failures.get(parent_key, 0)
+                if remaining:
+                    self.state.failures[parent_key] = remaining - 1
+            if remaining:
+                raise zotero_translate.TranslationError(
+                    "Concurrency limit exceeded for account"
+                )
+            output = self.state.root / f"{parent_key}.pdf"
+            output.write_bytes(b"%PDF-1.4 translated")
+            return output
+        finally:
+            finished = time.monotonic()
+            with self.state.lock:
+                self.state.active -= 1
+                self.state.finished.setdefault(parent_key, []).append(finished)
+
+
+class SlowAttachments(FakeAttachments):
+    def __init__(self) -> None:
+        super().__init__()
+        self.active = 0
+        self.max_active = 0
+        self.lock = threading.Lock()
+
+    def import_pdf(self, user_id, parent_key, output):
+        with self.lock:
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+        try:
+            time.sleep(0.02)
+            super().import_pdf(user_id, parent_key, output)
+        finally:
+            with self.lock:
+                self.active -= 1
 
 
 class WorkerTests(unittest.TestCase):
@@ -811,7 +931,7 @@ class WorkerTests(unittest.TestCase):
             with mock.patch.object(
                 zotero_translate, "load_pdf2zh_settings", return_value=settings()
             ):
-                result = worker.run_batch(7, 13, 1)
+                result = run_worker(worker)
             rows = store.read()
         self.assertEqual(result["done"], 1)
         self.assertEqual(rows[0]["status"], "done")
@@ -838,7 +958,7 @@ class WorkerTests(unittest.TestCase):
             with mock.patch.object(
                 zotero_translate, "load_pdf2zh_settings", return_value=settings()
             ):
-                worker.run_batch(7, 13, 1)
+                run_worker(worker)
         self.assertEqual(server.translate_calls, 0)
 
     def test_existing_output_is_renamed_to_current_template_before_import(self):
@@ -863,7 +983,7 @@ class WorkerTests(unittest.TestCase):
             with mock.patch.object(
                 zotero_translate, "load_pdf2zh_settings", return_value=settings()
             ):
-                worker.run_batch(7, 13, 1)
+                run_worker(worker)
             row = store.read()[0]
         imported = attachments.imports[0][2]
         self.assertEqual(imported.name, "source (Chinese).pdf")
@@ -888,7 +1008,7 @@ class WorkerTests(unittest.TestCase):
             with mock.patch.object(
                 zotero_translate, "load_pdf2zh_settings", return_value=settings()
             ):
-                result = worker.run_batch(7, 13, 1)
+                result = run_worker(worker)
         self.assertEqual(result["done"], 1)
         self.assertEqual(server.translate_calls, 0)
         self.assertEqual(attachments.imports, [])
@@ -911,7 +1031,7 @@ class WorkerTests(unittest.TestCase):
             with mock.patch.object(
                 zotero_translate, "load_pdf2zh_settings", return_value=settings()
             ):
-                result = worker.run_batch(7, 13, 1)
+                result = run_worker(worker)
             row = store.read()[0]
         self.assertEqual(result["failed"], 1)
         self.assertEqual(row["status"], "failed")
@@ -932,14 +1052,469 @@ class WorkerTests(unittest.TestCase):
                 server=FakeServer(root / "unused.pdf"),
                 attachments=FakeAttachments(),
             )
-            with mock.patch.object(
-                zotero_translate, "load_pdf2zh_settings", return_value=settings()
+            with (
+                mock.patch.object(
+                    zotero_translate, "load_pdf2zh_settings", return_value=settings()
+                ),
+                mock.patch.object(zotero_translate.time, "sleep") as sleep,
             ):
-                result = worker.run_batch(7, 13, 1, dry_run=True)
+                result = run_worker(worker, dry_run=True)
             after = store.path.read_bytes()
         self.assertTrue(result["dry_run"])
         self.assertEqual(before, after)
         self.assertEqual(worker.attachments.preflight_calls, [False])
+        sleep.assert_not_called()
+
+    def test_three_papers_run_concurrently_with_full_per_paper_limits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            keys = ["PAPER001", "PAPER002", "PAPER003"]
+            sources = {}
+            rows = []
+            for position, key in enumerate(keys, start=1):
+                source = root / f"source-{position}.pdf"
+                source.write_bytes(b"%PDF-1.4 source")
+                sources[key] = source
+                rows.append(
+                    pending_row(
+                        parent_key=key,
+                        source_key=f"SOURCE0{position}",
+                    )
+                )
+            store = zotero_translate.QueueStore(root / "queue.csv")
+            store.write(rows)
+            state = ConcurrentTranslationState(
+                root,
+                delays={key: 0.05 for key in keys},
+                barrier_count=3,
+            )
+            worker = zotero_translate.TranslationWorker(
+                store,
+                zotero=FakeZotero(sources),
+                server=FakeServer(root / "unused.pdf"),
+                server_factory=state.server,
+                attachments=FakeAttachments(),
+            )
+            writer_threads = []
+            real_write = store.write
+
+            def tracked_write(current_rows):
+                writer_threads.append(threading.get_ident())
+                real_write(current_rows)
+
+            store.write = tracked_write
+            main_thread = threading.get_ident()
+            with mock.patch.object(
+                zotero_translate, "load_pdf2zh_settings", return_value=settings()
+            ):
+                result = run_worker(
+                    worker,
+                    qps=2,
+                    pool_size=4,
+                    max_items=3,
+                    paper_concurrency=3,
+                )
+        self.assertEqual(result["done"], 3)
+        self.assertEqual(result["nominal_peak_qps"], 6)
+        self.assertEqual(result["nominal_peak_pool_size"], 12)
+        self.assertEqual(state.max_active, 3)
+        self.assertEqual(state.instances, 3)
+        self.assertEqual({call[1:] for call in state.calls}, {(2, 4)})
+        self.assertEqual(set(writer_threads), {main_thread})
+
+    def test_completed_downloads_import_in_completion_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            keys = ["PAPER001", "PAPER002"]
+            sources = {}
+            for position, key in enumerate(keys, start=1):
+                source = root / f"source-{position}.pdf"
+                source.write_bytes(b"%PDF-1.4 source")
+                sources[key] = source
+            store = zotero_translate.QueueStore(root / "queue.csv")
+            store.write(
+                [
+                    pending_row(parent_key="PAPER001", source_key="SOURCE01"),
+                    pending_row(parent_key="PAPER002", source_key="SOURCE02"),
+                ]
+            )
+            state = ConcurrentTranslationState(
+                root, delays={"PAPER001": 0.08, "PAPER002": 0.01}
+            )
+            attachments = FakeAttachments()
+            worker = zotero_translate.TranslationWorker(
+                store,
+                zotero=FakeZotero(sources),
+                server=FakeServer(root / "unused.pdf"),
+                server_factory=state.server,
+                attachments=attachments,
+            )
+            with mock.patch.object(
+                zotero_translate, "load_pdf2zh_settings", return_value=settings()
+            ):
+                run_worker(worker, max_items=2, paper_concurrency=2)
+        self.assertEqual(
+            [parent_key for _, parent_key, _ in attachments.imports],
+            ["PAPER002", "PAPER001"],
+        )
+
+    def test_each_slot_applies_its_own_inter_item_delay(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            keys = ["PAPER001", "PAPER002", "PAPER003", "PAPER004"]
+            sources = {}
+            rows = []
+            for position, key in enumerate(keys, start=1):
+                source = root / f"source-{position}.pdf"
+                source.write_bytes(b"%PDF-1.4 source")
+                sources[key] = source
+                rows.append(
+                    pending_row(
+                        parent_key=key,
+                        source_key=f"SOURCE0{position}",
+                    )
+                )
+            store = zotero_translate.QueueStore(root / "queue.csv")
+            store.write(rows)
+            state = ConcurrentTranslationState(
+                root,
+                delays={"PAPER001": 0.01, "PAPER002": 0.08},
+            )
+            worker = zotero_translate.TranslationWorker(
+                store,
+                zotero=FakeZotero(sources),
+                server=FakeServer(root / "unused.pdf"),
+                server_factory=state.server,
+                attachments=FakeAttachments(),
+            )
+            with mock.patch.object(
+                zotero_translate, "load_pdf2zh_settings", return_value=settings()
+            ):
+                run_worker(
+                    worker,
+                    max_items=4,
+                    paper_concurrency=2,
+                    inter_item_delay=0.12,
+                )
+        first_gap = state.started["PAPER003"][0] - state.finished["PAPER001"][0]
+        second_gap = state.started["PAPER004"][0] - state.finished["PAPER002"][0]
+        self.assertGreaterEqual(first_gap, 0.09)
+        self.assertGreaterEqual(second_gap, 0.09)
+        self.assertLess(state.started["PAPER003"][0], state.started["PAPER004"][0])
+
+    def test_transient_failure_waits_then_retries_same_paper(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source.pdf"
+            source.write_bytes(b"%PDF-1.4 source")
+            store = zotero_translate.QueueStore(root / "queue.csv")
+            store.write([pending_row()])
+            state = ConcurrentTranslationState(root, failures={"ABCD1234": 1})
+            worker = zotero_translate.TranslationWorker(
+                store,
+                zotero=FakeZotero(source),
+                server=FakeServer(root / "unused.pdf"),
+                server_factory=state.server,
+                attachments=FakeAttachments(),
+            )
+            with mock.patch.object(
+                zotero_translate, "load_pdf2zh_settings", return_value=settings()
+            ):
+                result = run_worker(
+                    worker,
+                    retry_delay=0.05,
+                    transient_retries=1,
+                )
+            row = store.read()[0]
+        self.assertEqual(result["selected"], 1)
+        self.assertEqual(result["retried"], 1)
+        self.assertEqual(result["done"], 1)
+        self.assertEqual(row["status"], "done")
+        self.assertEqual(row["attempt_count"], "2")
+        self.assertGreaterEqual(
+            state.started["ABCD1234"][1] - state.started["ABCD1234"][0],
+            0.04,
+        )
+
+    def test_transient_retry_exhaustion_marks_final_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source.pdf"
+            source.write_bytes(b"%PDF-1.4 source")
+            store = zotero_translate.QueueStore(root / "queue.csv")
+            store.write([pending_row()])
+            state = ConcurrentTranslationState(root, failures={"ABCD1234": 2})
+            worker = zotero_translate.TranslationWorker(
+                store,
+                zotero=FakeZotero(source),
+                server=FakeServer(root / "unused.pdf"),
+                server_factory=state.server,
+                attachments=FakeAttachments(),
+            )
+            with mock.patch.object(
+                zotero_translate, "load_pdf2zh_settings", return_value=settings()
+            ):
+                result = run_worker(worker, transient_retries=1)
+            row = store.read()[0]
+        self.assertEqual(result["retried"], 1)
+        self.assertEqual(result["failed"], 1)
+        self.assertEqual(row["status"], "failed")
+        self.assertEqual(row["attempt_count"], "2")
+        self.assertEqual(row["next_attempt_at"], "")
+
+    def test_other_slot_continues_while_one_paper_waits_to_retry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            keys = ["PAPER001", "PAPER002", "PAPER003"]
+            sources = {}
+            rows = []
+            for position, key in enumerate(keys, start=1):
+                source = root / f"source-{position}.pdf"
+                source.write_bytes(b"%PDF-1.4 source")
+                sources[key] = source
+                rows.append(
+                    pending_row(
+                        parent_key=key,
+                        source_key=f"SOURCE0{position}",
+                    )
+                )
+            store = zotero_translate.QueueStore(root / "queue.csv")
+            store.write(rows)
+            state = ConcurrentTranslationState(
+                root,
+                failures={"PAPER001": 1},
+                delays={"PAPER002": 0.01},
+            )
+            worker = zotero_translate.TranslationWorker(
+                store,
+                zotero=FakeZotero(sources),
+                server=FakeServer(root / "unused.pdf"),
+                server_factory=state.server,
+                attachments=FakeAttachments(),
+            )
+            with mock.patch.object(
+                zotero_translate, "load_pdf2zh_settings", return_value=settings()
+            ):
+                result = run_worker(
+                    worker,
+                    max_items=3,
+                    paper_concurrency=2,
+                    retry_delay=0.1,
+                    transient_retries=1,
+                )
+        self.assertEqual(result["done"], 3)
+        self.assertLess(state.started["PAPER003"][0], state.started["PAPER001"][1])
+
+    def test_transient_error_classifier_covers_provider_reconnect_failures(self):
+        for message in (
+            "HTTP 429",
+            "Concurrency limit exceeded for account",
+            "stream disconnected before completion",
+            "HTTP 503",
+        ):
+            with self.subTest(message=message):
+                self.assertTrue(
+                    zotero_translate.is_transient_translation_error(
+                        zotero_translate.TranslationError(message)
+                    )
+                )
+        self.assertFalse(
+            zotero_translate.is_transient_translation_error(
+                zotero_translate.TranslationError("invalid PDF")
+            )
+        )
+
+    def test_restart_honors_persisted_retry_time(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source.pdf"
+            source.write_bytes(b"%PDF-1.4 source")
+            store = zotero_translate.QueueStore(root / "queue.csv")
+            store.write(
+                [
+                    pending_row(
+                        status="retry_wait",
+                        attempt_count=1,
+                        next_attempt_at=zotero_translate.utc_timestamp(
+                            time.time() + 0.08
+                        ),
+                    )
+                ]
+            )
+            state = ConcurrentTranslationState(root)
+            worker = zotero_translate.TranslationWorker(
+                store,
+                zotero=FakeZotero(source),
+                server=FakeServer(root / "unused.pdf"),
+                server_factory=state.server,
+                attachments=FakeAttachments(),
+            )
+            started = time.monotonic()
+            with mock.patch.object(
+                zotero_translate, "load_pdf2zh_settings", return_value=settings()
+            ):
+                run_worker(worker, transient_retries=1)
+            elapsed = time.monotonic() - started
+            row = store.read()[0]
+        self.assertGreaterEqual(elapsed, 0.06)
+        self.assertEqual(row["status"], "done")
+        self.assertEqual(row["attempt_count"], "2")
+
+    def test_restart_honors_persisted_slot_cooldown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source.pdf"
+            source.write_bytes(b"%PDF-1.4 source")
+            store = zotero_translate.QueueStore(root / "queue.csv")
+            store.write(
+                [
+                    pending_row(
+                        status="waiting",
+                        next_attempt_at=zotero_translate.utc_timestamp(
+                            time.time() + 0.08
+                        ),
+                    )
+                ]
+            )
+            state = ConcurrentTranslationState(root)
+            worker = zotero_translate.TranslationWorker(
+                store,
+                zotero=FakeZotero(source),
+                server=FakeServer(root / "unused.pdf"),
+                server_factory=state.server,
+                attachments=FakeAttachments(),
+            )
+            started = time.monotonic()
+            with mock.patch.object(
+                zotero_translate, "load_pdf2zh_settings", return_value=settings()
+            ):
+                run_worker(worker)
+            elapsed = time.monotonic() - started
+            row = store.read()[0]
+        self.assertGreaterEqual(elapsed, 0.06)
+        self.assertEqual(row["status"], "done")
+        self.assertEqual(row["attempt_count"], "1")
+
+    def test_existing_local_translation_does_not_start_provider_cooldown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sources = {}
+            for position, key in enumerate(("PAPER001", "PAPER002"), start=1):
+                source = root / f"source-{position}.pdf"
+                source.write_bytes(b"%PDF-1.4 source")
+                sources[key] = source
+            existing = root / "existing.pdf"
+            existing.write_bytes(b"%PDF-1.4 translated")
+            store = zotero_translate.QueueStore(root / "queue.csv")
+            store.write(
+                [
+                    pending_row(
+                        str(existing),
+                        parent_key="PAPER001",
+                        source_key="SOURCE01",
+                    ),
+                    pending_row(parent_key="PAPER002", source_key="SOURCE02"),
+                ]
+            )
+            server = FakeServer(root / "second.pdf")
+            worker = zotero_translate.TranslationWorker(
+                store,
+                zotero=FakeZotero(sources),
+                server=server,
+                attachments=FakeAttachments(),
+            )
+            clock = [1000.0]
+            sleeps = []
+
+            def advance(seconds):
+                sleeps.append(seconds)
+                clock[0] += seconds
+
+            with (
+                mock.patch.object(
+                    zotero_translate, "load_pdf2zh_settings", return_value=settings()
+                ),
+                mock.patch.object(
+                    zotero_translate.time, "time", side_effect=lambda: clock[0]
+                ),
+                mock.patch.object(zotero_translate.time, "sleep", side_effect=advance),
+            ):
+                result = run_worker(
+                    worker,
+                    max_items=2,
+                    inter_item_delay=60,
+                )
+        self.assertEqual(result["done"], 2)
+        self.assertEqual(server.translate_calls, 1)
+        self.assertEqual(sleeps, [])
+
+    def test_retries_do_not_consume_additional_max_items(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sources = {}
+            for position, key in enumerate(("PAPER001", "PAPER002"), start=1):
+                source = root / f"source-{position}.pdf"
+                source.write_bytes(b"%PDF-1.4 source")
+                sources[key] = source
+            store = zotero_translate.QueueStore(root / "queue.csv")
+            store.write(
+                [
+                    pending_row(parent_key="PAPER001", source_key="SOURCE01"),
+                    pending_row(parent_key="PAPER002", source_key="SOURCE02"),
+                ]
+            )
+            state = ConcurrentTranslationState(root, failures={"PAPER001": 1})
+            worker = zotero_translate.TranslationWorker(
+                store,
+                zotero=FakeZotero(sources),
+                server=FakeServer(root / "unused.pdf"),
+                server_factory=state.server,
+                attachments=FakeAttachments(),
+            )
+            with mock.patch.object(
+                zotero_translate, "load_pdf2zh_settings", return_value=settings()
+            ):
+                result = run_worker(worker, transient_retries=1)
+            rows = store.read()
+        self.assertEqual(result["selected"], 1)
+        self.assertEqual(rows[0]["status"], "done")
+        self.assertEqual(rows[0]["attempt_count"], "2")
+        self.assertEqual(rows[1]["status"], "pending")
+
+    def test_zotero_imports_remain_serial(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            sources = {}
+            rows = []
+            for position, key in enumerate(("PAPER001", "PAPER002"), start=1):
+                source = root / f"source-{position}.pdf"
+                source.write_bytes(b"%PDF-1.4 source")
+                sources[key] = source
+                rows.append(
+                    pending_row(
+                        parent_key=key,
+                        source_key=f"SOURCE0{position}",
+                    )
+                )
+            store = zotero_translate.QueueStore(root / "queue.csv")
+            store.write(rows)
+            state = ConcurrentTranslationState(
+                root, delays={key: 0.02 for key in sources}
+            )
+            attachments = SlowAttachments()
+            worker = zotero_translate.TranslationWorker(
+                store,
+                zotero=FakeZotero(sources),
+                server=FakeServer(root / "unused.pdf"),
+                server_factory=state.server,
+                attachments=attachments,
+            )
+            with mock.patch.object(
+                zotero_translate, "load_pdf2zh_settings", return_value=settings()
+            ):
+                run_worker(worker, max_items=2, paper_concurrency=2)
+        self.assertEqual(len(attachments.imports), 2)
+        self.assertEqual(attachments.max_active, 1)
 
 
 class FakeWebDAVSession:
@@ -1324,13 +1899,25 @@ class SchedulingTests(unittest.TestCase):
             ) as run,
         ):
             result = zotero_translate.schedule_translation(
-                run_at, Path("queue.csv"), 7, 13, 2
+                run_at,
+                Path("queue.csv"),
+                qps=7,
+                pool_size=13,
+                paper_concurrency=3,
+                inter_item_delay=420,
+                retry_delay=300,
+                transient_retries=1,
+                max_items=2,
             )
         command = run.call_args.args[0]
         self.assertIn("--user", command)
         self.assertIn("--collect", command)
         self.assertTrue(any(value.startswith("--on-calendar=") for value in command))
         self.assertIn("--prefs", command)
+        self.assertIn("--paper-concurrency", command)
+        self.assertIn("--inter-item-delay", command)
+        self.assertIn("--retry-delay", command)
+        self.assertIn("--transient-retries", command)
         self.assertEqual(result["scheduler"], "systemd-user-timer")
 
     def test_windows_schedule_uses_delete_after_run_task(self):
@@ -1353,7 +1940,15 @@ class SchedulingTests(unittest.TestCase):
             ) as run,
         ):
             result = zotero_translate.schedule_translation(
-                run_at, Path("queue.csv"), 7, 13, 2
+                run_at,
+                Path("queue.csv"),
+                qps=7,
+                pool_size=13,
+                paper_concurrency=3,
+                inter_item_delay=420,
+                retry_delay=300,
+                transient_retries=1,
+                max_items=2,
             )
         command = run.call_args.args[0]
         self.assertIn("/Z", command)

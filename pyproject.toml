@@ -12,6 +12,7 @@ requires-python = ">=3.11"
 dependencies = [
     "anyio>=4,<5",
     "mcp>=1.27,<2",
+    "mineru-open-sdk==0.1.1",
     "pydantic>=2.11,<3",
     "requests>=2.31,<3",
 ]
@@ -25,6 +26,7 @@ zotero-mcp-setup = "zotero_mcp.zotero_setup:main"
 zotero-mineru = "zotero_mcp.mineru_workflow:main"
 zotero-mineru-qmd = "zotero_mcp.mineru_qmd_pipeline:main"
 zotero-translate = "zotero_mcp.zotero_translate:main"
+zotero-workflow = "zotero_mcp.zotero_workflow:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

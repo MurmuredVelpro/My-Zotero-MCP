@@ -14,6 +14,12 @@ Purpose: guarded Zotero writes. Read-only Local API use does not need this key.
 zotero-mcp setup save-secret zotero
 ```
 
+The command writes a private UTF-8 plain-text file named
+`zotero_web_api_key.secret` under the user configuration directory. The file
+contains only the key and is protected with mode `0600` on WSL/Linux; the
+`.secret` suffix is a naming convention, not encryption. Do not put the value
+in the repository or paste it into chat.
+
 4. Verify:
 
 ```bash
@@ -32,6 +38,13 @@ Purpose: optional external PDF parsing. An account and Token are required, and u
 zotero-mcp setup save-secret mineru
 ```
 
+The command writes a private UTF-8 plain-text file named
+`mineru_api_token.secret` under the independent MinerU configuration directory
+(`~/.config/mineru` on WSL/Linux). The file contains only the Token and is
+protected with mode `0600` on WSL/Linux; the `.secret` suffix is a naming
+convention, not encryption. Do not put the value in the repository or paste it
+into chat.
+
 Authentication is verified on the first MinerU API request. Submission remains a separate user-approved action because it uploads PDFs to an external service.
 
 ## SciVerse
@@ -39,20 +52,27 @@ Authentication is verified on the first MinerU API request. Submission remains a
 Purpose: external literature search through an independent MCP. An account and Token are required, and usage quotas apply.
 
 1. Register at [SciVerse](https://sciverse.space/).
-2. Install and authenticate in the environment that launches SciVerse MCP:
+2. Save the Token through hidden terminal input:
 
 ```bash
-python -m pip install sciverse
-sciverse auth login
+zotero-mcp setup save-secret sciverse
 ```
 
-The login command handles credentials outside this repository. After login, rerun:
+The command writes `sciverse_api_token.secret` under the Zotero MCP user
+configuration directory. On WSL/Linux it must be a regular file owned by the
+current user with no group or other access; the setup check rejects symbolic
+links and insecure permissions. The launcher supplies the Token through the
+child process environment, not through Codex configuration or command-line
+arguments.
+
+3. Rerun:
 
 ```bash
 zotero-mcp setup plan --profile full
 ```
 
-SciVerse remains a separate MCP server. Zotero MCP does not proxy or store SciVerse credentials.
+SciVerse remains a separate MCP server. Zotero MCP only manages the local
+private Token file and does not proxy SciVerse requests.
 
 ## paper-lookup
 

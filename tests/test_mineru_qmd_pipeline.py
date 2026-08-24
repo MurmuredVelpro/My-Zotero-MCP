@@ -21,49 +21,48 @@ class FakeProcess:
 
 
 class MinerUQmdPipelineTests(unittest.TestCase):
-    def write_state(self, state_dir, batch_id, **fields):
-        state_dir.mkdir(parents=True, exist_ok=True)
+    def write_state(self, database, batch_id, **fields):
         state = {"batch_id": batch_id, "files": [], **fields}
-        (state_dir / f"{batch_id}.json").write_text(json.dumps(state), encoding="utf-8")
+        mineru_qmd_pipeline.mineru_workflow.save_state(state, database)
 
     def test_find_active_batch_recovers_one_unfinished_job(self):
         with tempfile.TemporaryDirectory() as tmp:
-            state_dir = Path(tmp)
+            database = Path(tmp) / "workflow.sqlite3"
             self.write_state(
-                state_dir,
+                database,
                 "DONE",
                 collection_key="COLL",
                 status="complete",
             )
             self.write_state(
-                state_dir,
+                database,
                 "ACTIVE",
                 collection_key="COLL",
                 status="processing",
             )
             self.assertEqual(
-                mineru_qmd_pipeline.find_active_batch("COLL", state_dir),
+                mineru_qmd_pipeline.find_active_batch("COLL", database),
                 "ACTIVE",
             )
 
     def test_find_active_batch_rejects_multiple_unfinished_jobs(self):
         with tempfile.TemporaryDirectory() as tmp:
-            state_dir = Path(tmp)
+            database = Path(tmp) / "workflow.sqlite3"
             for batch_id in ("ONE", "TWO"):
                 self.write_state(
-                    state_dir,
+                    database,
                     batch_id,
                     collection_key="COLL",
                     status="uploaded",
                 )
             with self.assertRaisesRegex(RuntimeError, "Multiple unfinished"):
-                mineru_qmd_pipeline.find_active_batch("COLL", state_dir)
+                mineru_qmd_pipeline.find_active_batch("COLL", database)
 
     def test_failed_item_requires_explicit_retry(self):
         with tempfile.TemporaryDirectory() as tmp:
-            state_dir = Path(tmp)
+            database = Path(tmp) / "workflow.sqlite3"
             self.write_state(
-                state_dir,
+                database,
                 "FAILED",
                 collection_key="COLL",
                 status="complete",
@@ -71,25 +70,23 @@ class MinerUQmdPipelineTests(unittest.TestCase):
             )
             self.assertEqual(
                 mineru_qmd_pipeline.unresolved_failed_keys(
-                    "COLL", {"ITEM1", "ITEM2"}, state_dir
+                    "COLL", {"ITEM1", "ITEM2"}, database
                 ),
                 ["ITEM1"],
             )
 
     def test_upload_failure_also_requires_explicit_retry(self):
         with tempfile.TemporaryDirectory() as tmp:
-            state_dir = Path(tmp)
+            database = Path(tmp) / "workflow.sqlite3"
             self.write_state(
-                state_dir,
+                database,
                 "FAILED",
                 collection_key="COLL",
                 status="partial-upload",
                 files=[{"data_id": "ITEM1", "upload_error": "timeout"}],
             )
             self.assertEqual(
-                mineru_qmd_pipeline.unresolved_failed_keys(
-                    "COLL", {"ITEM1"}, state_dir
-                ),
+                mineru_qmd_pipeline.unresolved_failed_keys("COLL", {"ITEM1"}, database),
                 ["ITEM1"],
             )
 
@@ -137,7 +134,7 @@ class MinerUQmdPipelineTests(unittest.TestCase):
             mock.patch.object(mineru_qmd_pipeline, "run_qmd_update") as update,
             mock.patch.object(
                 mineru_qmd_pipeline.mineru_workflow,
-                "todo_keys_needing_qmd",
+                "mineru_keys_needing_qmd",
                 return_value=["ITEM1"],
             ),
             mock.patch.object(
@@ -158,7 +155,7 @@ class MinerUQmdPipelineTests(unittest.TestCase):
             mock.patch.object(mineru_qmd_pipeline, "run_qmd_update") as update,
             mock.patch.object(
                 mineru_qmd_pipeline.mineru_workflow,
-                "todo_keys_needing_qmd",
+                "mineru_keys_needing_qmd",
                 return_value=[],
             ),
             mock.patch.object(mineru_qmd_pipeline, "start_qmd_embed") as embed,
@@ -168,7 +165,7 @@ class MinerUQmdPipelineTests(unittest.TestCase):
         update.assert_not_called()
         embed.assert_not_called()
 
-    def test_successful_embed_marks_parsed_todo_rows_indexed(self):
+    def test_successful_embed_marks_parsed_mineru_rows_indexed(self):
         process = FakeProcess(return_code=0)
         process.qmd_item_keys = ["ITEM1"]
         with (
@@ -179,7 +176,7 @@ class MinerUQmdPipelineTests(unittest.TestCase):
             ),
             mock.patch.object(
                 mineru_qmd_pipeline.mineru_workflow,
-                "mark_todo_qmd_indexed",
+                "mark_mineru_qmd_indexed",
             ) as mark_indexed,
         ):
             mineru_qmd_pipeline.wait_qmd_embed(process)
@@ -196,7 +193,7 @@ class MinerUQmdPipelineTests(unittest.TestCase):
             ),
             mock.patch.object(
                 mineru_qmd_pipeline.mineru_workflow,
-                "mark_todo_qmd_indexed",
+                "mark_mineru_qmd_indexed",
             ) as mark_indexed,
             self.assertRaisesRegex(RuntimeError, "ITEM2"),
         ):
@@ -206,7 +203,14 @@ class MinerUQmdPipelineTests(unittest.TestCase):
     def test_qmd_verification_uses_one_multi_get_process(self):
         result = SimpleNamespace(
             returncode=0,
-            stdout=json.dumps([{"file": "qmd://zotero-mineru/ITEM1/full.md"}]),
+            stdout=json.dumps(
+                [
+                    {"file": "ITEM1/full.md"},
+                    {"file": "qmd://zotero-mineru/ITEM2/full.md"},
+                    {"file": "qmd://other/ITEM3/full.md"},
+                    {"file": "ITEM4/notes.md"},
+                ]
+            ),
             stderr="",
         )
         with (
@@ -220,9 +224,11 @@ class MinerUQmdPipelineTests(unittest.TestCase):
                 mineru_qmd_pipeline.subprocess, "run", return_value=result
             ) as run,
         ):
-            verified, missing = mineru_qmd_pipeline.verify_qmd_items(["ITEM1", "ITEM2"])
-        self.assertEqual(verified, ["ITEM1"])
-        self.assertEqual(missing, ["ITEM2"])
+            verified, missing = mineru_qmd_pipeline.verify_qmd_items(
+                ["ITEM1", "ITEM2", "ITEM3", "ITEM4"]
+            )
+        self.assertEqual(verified, ["ITEM1", "ITEM2"])
+        self.assertEqual(missing, ["ITEM3", "ITEM4"])
         run.assert_called_once()
         self.assertIn("multi-get", run.call_args.args[0])
 
@@ -231,7 +237,7 @@ class MinerUQmdPipelineTests(unittest.TestCase):
         with (
             mock.patch.object(
                 mineru_qmd_pipeline.mineru_workflow,
-                "todo_keys_needing_qmd",
+                "mineru_keys_needing_qmd",
                 return_value=["ITEM1"],
             ),
             mock.patch.object(

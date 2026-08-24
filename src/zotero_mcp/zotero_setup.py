@@ -9,6 +9,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tomllib
@@ -34,6 +35,7 @@ PDF2ZH_URL = "https://github.com/guaguastandup/zotero-pdf2zh"
 QMD_PACKAGE = "@tobilu/qmd"
 DEFAULT_QMD_COLLECTION = "zotero-mineru"
 REQUIRED_DISTRIBUTIONS = ("mcp", "pydantic", "anyio", "requests")
+SCIVERSE_SECRET_NAME = "sciverse_api_token.secret"
 
 
 def component(
@@ -53,6 +55,29 @@ def component(
 
 def optional_or_manual(profile: str) -> str:
     return "manual_action_required" if profile == "full" else "optional"
+
+
+def default_sciverse_token_path() -> Path:
+    return zotero_runtime.default_secret_path(SCIVERSE_SECRET_NAME)
+
+
+def private_secret_file_error(path: Path) -> str:
+    try:
+        if path.is_symlink():
+            return "secret file must not be a symbolic link"
+        metadata = path.stat()
+    except OSError as exc:
+        return f"secret file cannot be inspected: {type(exc).__name__}: {exc}"
+    if not stat.S_ISREG(metadata.st_mode):
+        return "secret path must be a regular file"
+    if metadata.st_size < 1:
+        return "secret file is empty"
+    if os.name != "nt":
+        if metadata.st_uid != os.getuid():
+            return "secret file must be owned by the current user"
+        if metadata.st_mode & 0o077:
+            return "secret file permissions must not allow group or other access"
+    return ""
 
 
 def configured_command(section: str, key: str, env_name: str, fallback: str) -> str:
@@ -225,12 +250,26 @@ def sciverse_status(profile: str) -> dict[str, Any]:
     except RuntimeError:
         home = zotero_runtime.config_dir().parent
     credentials = home / ".sciverse" / "credentials.json"
-    token_file = zotero_runtime.configured_path(
-        "SCIVERSE_API_TOKEN_FILE", "sciverse", "token_file"
+    token_file = (
+        zotero_runtime.configured_path(
+            "SCIVERSE_API_TOKEN_FILE", "sciverse", "token_file"
+        )
+        or default_sciverse_token_path()
     )
+    token_error = private_secret_file_error(token_file) if token_file.exists() else ""
+    if token_error:
+        return component(
+            optional_or_manual(profile),
+            "SciVerse Token file is not private.",
+            action=(
+                "Run zotero-mcp setup save-secret sciverse --overwrite to replace "
+                "it with a private file."
+            ),
+            details={"credentials_file": str(token_file), "error": token_error},
+        )
     token_available = (
         bool(os.environ.get("SCIVERSE_API_TOKEN", "").strip())
-        or bool(token_file and token_file.is_file() and token_file.stat().st_size > 0)
+        or bool(token_file.is_file() and token_file.stat().st_size > 0)
         or (credentials.is_file() and credentials.stat().st_size > 0)
     )
     if not executable and not npx:
@@ -248,8 +287,8 @@ def sciverse_status(profile: str) -> dict[str, Any]:
             "SciVerse is an external literature service that requires an account "
             "and Token; usage quotas apply.",
             action=(
-                f"Register at {SCIVERSE_URL}, then run pip install sciverse and "
-                "sciverse auth login in this environment."
+                f"Register at {SCIVERSE_URL}, create a Token, then run "
+                "zotero-mcp setup save-secret sciverse."
             ),
             details={"runtime": executable or npx},
         )
@@ -259,7 +298,9 @@ def sciverse_status(profile: str) -> dict[str, Any]:
         "has usage quotas.",
         details={
             "runtime": executable or npx,
-            "credentials_file": str(token_file or credentials),
+            "credentials_file": str(
+                token_file if token_file.is_file() else credentials
+            ),
         },
     )
 
@@ -460,7 +501,6 @@ def render_user_config(
     *,
     local_api: str | None = None,
     mineru_output: Path | None = None,
-    mineru_ledger: Path | None = None,
     qmd_command: str | None = None,
     qmd_collection: str = DEFAULT_QMD_COLLECTION,
 ) -> str:
@@ -475,8 +515,6 @@ def render_user_config(
             f"output_dir = {toml_string(str(mineru_output or mineru_client.DEFAULT_OUTPUT_ROOT))}",
         ]
     )
-    if mineru_ledger:
-        lines.append(f"ledger = {toml_string(str(mineru_ledger))}")
     lines.extend(
         [
             "",
@@ -496,10 +534,12 @@ def render_user_config(
 
 
 def write_private_file(path: Path, content: str, *, overwrite: bool = False) -> Path:
-    path = path.expanduser().resolve()
+    path = path.expanduser().absolute()
+    if path.is_symlink():
+        raise ValueError(f"Refusing to write secret through a symbolic link: {path}")
     if path.exists() and not overwrite:
         raise FileExistsError(f"Refusing to overwrite existing file: {path}")
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     temporary = path.parent / f".{path.name}.{os.getpid()}.tmp"
     descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
@@ -518,17 +558,19 @@ def write_private_file(path: Path, content: str, *, overwrite: bool = False) -> 
 
 
 def save_secret(kind: str, value: str, *, overwrite: bool = False) -> Path:
-    names = {
-        "zotero": "zotero_web_api_key",
-        "mineru": "mineru_api_token",
-    }
-    if kind not in names:
-        raise ValueError("secret kind must be zotero or mineru")
+    if kind not in {"zotero", "mineru", "sciverse"}:
+        raise ValueError("secret kind must be zotero, mineru, or sciverse")
     cleaned = value.strip()
     if not cleaned:
         raise ValueError("secret cannot be empty")
+    if kind == "mineru":
+        path = mineru_client.default_token_path()
+    elif kind == "sciverse":
+        path = default_sciverse_token_path()
+    else:
+        path = zotero_runtime.default_secret_path("zotero_web_api_key.secret")
     return write_private_file(
-        zotero_runtime.default_secret_path(names[kind]),
+        path,
         cleaned,
         overwrite=overwrite,
     )
@@ -634,7 +676,6 @@ def _parser() -> argparse.ArgumentParser:
     configure.add_argument("--storage", type=Path, required=True)
     configure.add_argument("--local-api")
     configure.add_argument("--mineru-output", type=Path)
-    configure.add_argument("--mineru-ledger", type=Path)
     configure.add_argument("--qmd-command")
     configure.add_argument("--qmd-collection", default=DEFAULT_QMD_COLLECTION)
     configure.add_argument("--overwrite", action="store_true")
@@ -642,7 +683,7 @@ def _parser() -> argparse.ArgumentParser:
     secret = subparsers.add_parser(
         "save-secret", help="Save a secret from hidden terminal input."
     )
-    secret.add_argument("kind", choices=("zotero", "mineru", "webdav"))
+    secret.add_argument("kind", choices=("zotero", "mineru", "sciverse", "webdav"))
     secret.add_argument("--overwrite", action="store_true")
 
     config = subparsers.add_parser(
@@ -670,7 +711,6 @@ def main(argv: list[str] | None = None) -> None:
             arguments.storage,
             local_api=arguments.local_api,
             mineru_output=arguments.mineru_output,
-            mineru_ledger=arguments.mineru_ledger,
             qmd_command=arguments.qmd_command,
             qmd_collection=arguments.qmd_collection,
         )

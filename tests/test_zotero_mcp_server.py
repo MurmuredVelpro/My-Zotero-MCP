@@ -519,7 +519,7 @@ class CollectionToolTests(unittest.TestCase):
         item = {"data": {"key": "ITEM1"}}
         workflow = mock.Mock()
         workflow.tracked_result_status.return_value = "stale"
-        workflow.todo_rows_by_key.return_value = {
+        workflow.mineru_records_by_key.return_value = {
             "ITEM1": {"parsed_attachment_key": "OLDPDF1"}
         }
         with (

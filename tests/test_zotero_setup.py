@@ -41,15 +41,56 @@ class SetupTests(unittest.TestCase):
             with self.assertRaisesRegex(FileExistsError, "Refusing to overwrite"):
                 zotero_setup.write_private_file(path, "new")
 
+    @unittest.skipIf(os.name == "nt", "Windows symlink creation needs extra privileges")
+    def test_write_private_file_refuses_symbolic_link_even_with_overwrite(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "target"
+            target.write_text("old", encoding="utf-8")
+            path = Path(tmp) / "secret"
+            path.symlink_to(target)
+            with self.assertRaisesRegex(ValueError, "symbolic link"):
+                zotero_setup.write_private_file(path, "new", overwrite=True)
+            self.assertEqual(target.read_text(encoding="utf-8"), "old")
+
     def test_save_secret_uses_user_config_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
+            expected = Path(tmp) / "mineru_api_token.secret"
+            with mock.patch.object(
+                zotero_setup.mineru_client,
+                "default_token_path",
+                return_value=expected,
+            ) as default_path:
+                path = zotero_setup.save_secret("mineru", "secret-value")
+            self.assertEqual(path, expected)
+            self.assertEqual(path.read_text(encoding="utf-8").strip(), "secret-value")
+            default_path.assert_called_once_with()
+
+    def test_save_zotero_secret_uses_secret_filename(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            expected = Path(tmp) / "zotero_web_api_key.secret"
             with mock.patch.object(
                 zotero_setup.zotero_runtime,
                 "default_secret_path",
-                return_value=Path(tmp) / "mineru_api_token",
-            ):
-                path = zotero_setup.save_secret("mineru", "secret-value")
+                return_value=expected,
+            ) as default_path:
+                path = zotero_setup.save_secret("zotero", "secret-value")
+            self.assertEqual(path, expected)
+            default_path.assert_called_once_with("zotero_web_api_key.secret")
+
+    def test_save_sciverse_secret_uses_private_secret_filename(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            expected = Path(tmp) / "sciverse_api_token.secret"
+            with mock.patch.object(
+                zotero_setup,
+                "default_sciverse_token_path",
+                return_value=expected,
+            ) as default_path:
+                path = zotero_setup.save_secret("sciverse", "secret-value")
+            self.assertEqual(path, expected)
             self.assertEqual(path.read_text(encoding="utf-8").strip(), "secret-value")
+            default_path.assert_called_once_with()
+            if os.name != "nt":
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
     def test_save_webdav_secret_is_private_and_structured(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -117,6 +158,8 @@ class SetupTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             token_file = Path(tmp) / "token"
             token_file.write_text("present", encoding="utf-8")
+            if os.name != "nt":
+                token_file.chmod(0o600)
             with (
                 mock.patch.object(
                     zotero_setup,
@@ -132,6 +175,55 @@ class SetupTests(unittest.TestCase):
             ):
                 result = zotero_setup.sciverse_status("full")
         self.assertEqual(result["status"], "ready")
+
+    @unittest.skipIf(os.name == "nt", "Windows uses inherited user-profile ACLs")
+    def test_sciverse_rejects_token_readable_by_group_or_others(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            token_file = Path(tmp) / "token"
+            token_file.write_text("present", encoding="utf-8")
+            token_file.chmod(0o644)
+            with (
+                mock.patch.object(
+                    zotero_setup,
+                    "configured_command",
+                    return_value="sciverse-mcp-server",
+                ),
+                mock.patch.object(
+                    zotero_setup.zotero_runtime,
+                    "configured_path",
+                    return_value=token_file,
+                ),
+                mock.patch.dict(os.environ, {}, clear=True),
+            ):
+                result = zotero_setup.sciverse_status("full")
+        self.assertEqual(result["status"], "manual_action_required")
+        self.assertIn("not private", result["summary"])
+        self.assertIn("group or other", result["details"]["error"])
+
+    @unittest.skipIf(os.name == "nt", "Windows uses inherited user-profile ACLs")
+    def test_sciverse_rejects_symbolic_link_token(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "target"
+            target.write_text("present", encoding="utf-8")
+            target.chmod(0o600)
+            token_file = Path(tmp) / "token"
+            token_file.symlink_to(target)
+            with (
+                mock.patch.object(
+                    zotero_setup,
+                    "configured_command",
+                    return_value="sciverse-mcp-server",
+                ),
+                mock.patch.object(
+                    zotero_setup.zotero_runtime,
+                    "configured_path",
+                    return_value=token_file,
+                ),
+                mock.patch.dict(os.environ, {}, clear=True),
+            ):
+                result = zotero_setup.sciverse_status("full")
+        self.assertEqual(result["status"], "manual_action_required")
+        self.assertIn("symbolic link", result["details"]["error"])
 
     def test_missing_paper_lookup_is_optional_and_links_upstream(self):
         with (

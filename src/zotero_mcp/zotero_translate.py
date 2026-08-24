@@ -20,7 +20,9 @@ import tempfile
 import time
 import uuid
 import zipfile
-from collections.abc import Iterator, Mapping
+from collections import deque
+from collections.abc import Callable, Iterator, Mapping
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -41,8 +43,19 @@ QUEUE_FIELDS = (
     "status",
     "output_pdf",
     "last_error",
+    "attempt_count",
+    "downloaded_at",
+    "next_attempt_at",
 )
-VALID_STATUSES = {"pending", "translating", "importing", "done", "failed"}
+VALID_STATUSES = {
+    "pending",
+    "waiting",
+    "translating",
+    "importing",
+    "retry_wait",
+    "done",
+    "failed",
+}
 DEFAULT_TRANSLATION_ATTACHMENT_TITLE = "CN"
 DEFAULT_TRANSLATION_FILENAME_TEMPLATE = "{source_stem}的全文翻译.pdf"
 CN_TITLE = DEFAULT_TRANSLATION_ATTACHMENT_TITLE
@@ -83,6 +96,18 @@ REQUEST_PREFS = (
     "enhanceCompatibility",
     "translateTableText",
     "onlyIncludeTranslatedPage",
+)
+TRANSIENT_TRANSLATION_PATTERNS = (
+    "http 429",
+    "too many requests",
+    "concurrency limit exceeded",
+    "stream disconnected before completion",
+    "connection reset",
+    "connection aborted",
+    "remote disconnected",
+    "temporarily unavailable",
+    "timed out",
+    "timeout",
 )
 
 
@@ -249,6 +274,46 @@ def positive_int(value: str) -> int:
     return parsed
 
 
+def nonnegative_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must not be negative")
+    return parsed
+
+
+def utc_timestamp(timestamp: float | None = None) -> str:
+    value = (
+        datetime.now(UTC)
+        if timestamp is None
+        else datetime.fromtimestamp(timestamp, UTC)
+    )
+    return value.isoformat(timespec="microseconds")
+
+
+def parse_queue_timestamp(value: str, *, field: str) -> float | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise TranslationError(f"invalid {field}: {value}") from exc
+    if parsed.tzinfo is None:
+        raise TranslationError(f"{field} must include a timezone: {value}")
+    return parsed.timestamp()
+
+
+def is_transient_translation_error(exc: BaseException) -> bool:
+    if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
+        return True
+    message = str(exc).casefold()
+    return any(
+        pattern in message for pattern in TRANSIENT_TRANSLATION_PATTERNS
+    ) or bool(re.search(r"\b(?:502|503|504)\b", message))
+
+
 def state_dir() -> Path:
     override = os.environ.get("ZOTERO_TRANSLATE_STATE", "").strip()
     if override:
@@ -363,6 +428,21 @@ class QueueStore:
                     raise TranslationError(
                         f"invalid {field} at CSV line {line}: {row[field]}"
                     )
+            try:
+                attempts = int(row["attempt_count"])
+            except ValueError as exc:
+                raise TranslationError(
+                    f"invalid attempt_count at CSV line {line}: {row['attempt_count']}"
+                ) from exc
+            if attempts < 0:
+                raise TranslationError(
+                    f"invalid attempt_count at CSV line {line}: {row['attempt_count']}"
+                )
+            for field in ("downloaded_at", "next_attempt_at"):
+                try:
+                    parse_queue_timestamp(row[field], field=field)
+                except TranslationError as exc:
+                    raise TranslationError(f"CSV line {line}: {exc}") from exc
         return rows
 
     def write(self, rows: list[dict[str, str]]) -> None:
@@ -1805,6 +1885,19 @@ class ZoteroAttachmentClient:
         }
 
 
+@dataclass(frozen=True)
+class TranslationDownload:
+    output: Path
+    downloaded_at: str
+
+
+@dataclass
+class WorkerSlot:
+    slot_id: int
+    item_index: int | None = None
+    ready_at: float = 0.0
+
+
 class TranslationWorker:
     def __init__(
         self,
@@ -1814,6 +1907,7 @@ class TranslationWorker:
         attachments: ZoteroAttachmentClient | None = None,
         prefs_path: Path | None = None,
         naming: TranslationNaming | None = None,
+        server_factory: Callable[[], PDF2ZHClient] | None = None,
     ) -> None:
         selected_naming = naming or load_translation_naming()
         self.store = store
@@ -1822,6 +1916,15 @@ class TranslationWorker:
         self.server = server or PDF2ZHClient(naming=selected_naming)
         self.attachments = attachments or ZoteroAttachmentClient(naming=selected_naming)
         self.prefs_path = prefs_path
+        if server_factory is not None:
+            self.server_factory = server_factory
+        elif server is not None:
+            self.server_factory = lambda: self.server
+        else:
+            output_dir = self.server.output_dir
+            self.server_factory = lambda: PDF2ZHClient(
+                output_dir=output_dir, naming=selected_naming
+            )
 
     def enqueue(self, keys: list[str]) -> dict[str, int]:
         with self.store.lock():
@@ -1845,6 +1948,9 @@ class TranslationWorker:
                         else "pending",
                         "output_pdf": "",
                         "last_error": "",
+                        "attempt_count": "0",
+                        "downloaded_at": "",
+                        "next_attempt_at": "",
                     }
                 )
                 known.add(parent_key)
@@ -1868,12 +1974,23 @@ class TranslationWorker:
                 if row["parent_item_key"] in requested and row["status"] == "failed":
                     row["status"] = "pending"
                     row["last_error"] = ""
+                    row["attempt_count"] = "0"
+                    row["next_attempt_at"] = ""
                     reset += 1
             self.store.write(rows)
         return {"reset": reset}
 
     def run_batch(
-        self, qps: int, pool_size: int, max_items: int, dry_run: bool = False
+        self,
+        qps: int,
+        pool_size: int,
+        max_items: int,
+        *,
+        paper_concurrency: int,
+        inter_item_delay: int,
+        retry_delay: int,
+        transient_retries: int,
+        dry_run: bool = False,
     ) -> dict[str, Any]:
         with self.store.lock():
             rows = self.store.read()
@@ -1890,7 +2007,9 @@ class TranslationWorker:
                 if recovered:
                     self.store.write(rows)
             selected = [
-                index for index, row in enumerate(rows) if row["status"] == "pending"
+                index
+                for index, row in enumerate(rows)
+                if row["status"] in {"pending", "waiting", "retry_wait"}
             ][:max_items]
             if not selected:
                 return {
@@ -1906,30 +2025,32 @@ class TranslationWorker:
             user_id = self.attachments.preflight(verify_write=not dry_run)
             if dry_run:
                 return self._dry_run(
-                    rows, selected, settings, server_url, user_id, qps, pool_size
+                    rows,
+                    selected,
+                    settings,
+                    server_url,
+                    user_id,
+                    qps,
+                    pool_size,
+                    paper_concurrency,
+                    inter_item_delay,
+                    retry_delay,
+                    transient_retries,
                 )
-
-            done = failed = 0
-            for index in selected:
-                try:
-                    self._process_row(rows, index, settings, user_id, qps, pool_size)
-                except Exception as exc:  # noqa: BLE001 - one row must not stop the batch
-                    rows[index]["status"] = "failed"
-                    rows[index]["last_error"] = settings.redact(str(exc))[
-                        :MAX_ERROR_LENGTH
-                    ]
-                    self.store.write(rows)
-                    failed += 1
-                else:
-                    done += 1
-            return {
-                "selected": len(selected),
-                "done": done,
-                "failed": failed,
-                "recovered_as_failed": recovered,
-                "service": settings.service,
-                "model": settings.model,
-            }
+            return self._run_selected(
+                rows,
+                selected,
+                settings,
+                server_url,
+                user_id,
+                qps,
+                pool_size,
+                paper_concurrency,
+                inter_item_delay,
+                retry_delay,
+                transient_retries,
+                recovered,
+            )
 
     def _dry_run(
         self,
@@ -1940,6 +2061,10 @@ class TranslationWorker:
         user_id: int,
         qps: int,
         pool_size: int,
+        paper_concurrency: int,
+        inter_item_delay: int,
+        retry_delay: int,
+        transient_retries: int,
     ) -> dict[str, Any]:
         items = []
         for index in selected:
@@ -1957,6 +2082,8 @@ class TranslationWorker:
                         self.zotero.cn_attachment(row["parent_item_key"])
                     ),
                     "local_translation_ready": bool(output and output.is_file()),
+                    "status": row["status"],
+                    "next_attempt_at": row["next_attempt_at"],
                 }
             )
         return {
@@ -1966,60 +2093,327 @@ class TranslationWorker:
             "server_url": server_url,
             "service": settings.service,
             "model": settings.model,
-            "qps": qps,
-            "pool_size": pool_size,
+            "paper_concurrency": paper_concurrency,
+            "qps_per_paper": qps,
+            "pool_size_per_paper": pool_size,
+            "nominal_peak_qps": qps * paper_concurrency,
+            "nominal_peak_pool_size": pool_size * paper_concurrency,
+            "inter_item_delay": inter_item_delay,
+            "retry_delay": retry_delay,
+            "transient_retries": transient_retries,
             "items": items,
         }
 
-    def _process_row(
+    @staticmethod
+    def _assign_next(
+        slot: WorkerSlot,
+        pending: deque[int],
+        rows: list[dict[str, str]],
+        earliest: float,
+    ) -> bool:
+        if not pending:
+            slot.item_index = None
+            slot.ready_at = 0.0
+            return False
+        now = time.time()
+        index = pending.popleft()
+        row = rows[index]
+        persisted = parse_queue_timestamp(
+            row["next_attempt_at"], field="next_attempt_at"
+        )
+        slot.item_index = index
+        slot.ready_at = max(earliest, persisted or now)
+        if row["status"] in {"pending", "waiting"}:
+            if slot.ready_at > now:
+                row["status"] = "waiting"
+                row["next_attempt_at"] = utc_timestamp(slot.ready_at)
+            else:
+                row["status"] = "pending"
+                row["next_attempt_at"] = ""
+        elif persisted is None or slot.ready_at > persisted:
+            row["next_attempt_at"] = utc_timestamp(slot.ready_at)
+        return True
+
+    @staticmethod
+    def _ready_slot_priority(
+        slot: WorkerSlot, rows: list[dict[str, str]]
+    ) -> tuple[int, int]:
+        if slot.item_index is None:
+            return (99, slot.slot_id)
+        rank = {
+            "pending": 0,
+            "waiting": 1,
+            "retry_wait": 2,
+        }.get(rows[slot.item_index]["status"], 3)
+        return rank, slot.slot_id
+
+    def _translation_server(self, server_url: str) -> PDF2ZHClient:
+        server = self.server_factory()
+        if hasattr(server, "base_url"):
+            server.base_url = server_url
+        return server
+
+    def _translate_pdf(
+        self,
+        settings: PDF2ZHSettings,
+        server_url: str,
+        parent_key: str,
+        source_key: str,
+        source_pdf: Path,
+        qps: int,
+        pool_size: int,
+    ) -> TranslationDownload:
+        output = self._translation_server(server_url).translate(
+            settings, parent_key, source_key, source_pdf, qps, pool_size
+        )
+        validate_pdf(output)
+        return TranslationDownload(output=output, downloaded_at=utc_timestamp())
+
+    def _normalize_output(self, source_pdf: Path, output: Path) -> Path:
+        target = output.with_name(self.naming.filename_for(source_pdf.stem))
+        if target == output:
+            return output
+        if target.exists():
+            raise TranslationError(
+                f"configured translation output filename already exists: {target}"
+            )
+        try:
+            os.replace(output, target)
+        except OSError as exc:
+            raise TranslationError(
+                f"cannot apply configured translation filename: {output} -> {target}: {exc}"
+            ) from exc
+        return target
+
+    def _start_slot(
         self,
         rows: list[dict[str, str]],
-        index: int,
+        slot: WorkerSlot,
         settings: PDF2ZHSettings,
+        server_url: str,
         user_id: int,
         qps: int,
         pool_size: int,
-    ) -> None:
+        executor: ThreadPoolExecutor,
+        active_by_slot: dict[int, Future[TranslationDownload]],
+        future_slots: dict[Future[TranslationDownload], WorkerSlot],
+    ) -> tuple[int, int] | None:
+        if slot.item_index is None:
+            return None
+        index = slot.item_index
         row = rows[index]
         parent_key = row["parent_item_key"]
         source_key = row["source_attachment_key"]
         output = Path(row["output_pdf"]) if row["output_pdf"] else None
-        if self.zotero.cn_attachment(parent_key) and not (output and output.is_file()):
+        if self.zotero.cn_attachment(parent_key):
             row["status"] = "done"
             row["last_error"] = ""
-            self.store.write(rows)
-            return
+            row["next_attempt_at"] = ""
+            return (1, 0)
         source_pdf = self.zotero.source_pdf(parent_key, source_key)
         if output and output.is_file():
-            validate_pdf(output)
-        else:
-            row["status"] = "translating"
-            row["last_error"] = ""
-            self.store.write(rows)
-            output = self.server.translate(
-                settings, parent_key, source_key, source_pdf, qps, pool_size
-            )
-            row["output_pdf"] = str(output)
-        target = output.with_name(self.naming.filename_for(source_pdf.stem))
-        if target != output:
-            if target.exists():
-                raise TranslationError(
-                    f"configured translation output filename already exists: {target}"
-                )
             try:
-                os.replace(output, target)
-            except OSError as exc:
-                raise TranslationError(
-                    f"cannot apply configured translation filename: {output} -> {target}: {exc}"
-                ) from exc
-            output = target
-        row["output_pdf"] = str(output)
-        row["status"] = "importing"
-        self.store.write(rows)
-        self.attachments.import_pdf(user_id, parent_key, output)
-        row["status"] = "done"
+                validate_pdf(output)
+                output = self._normalize_output(source_pdf, output)
+                row["output_pdf"] = str(output)
+                row["status"] = "importing"
+                row["next_attempt_at"] = ""
+                self.store.write(rows)
+                self.attachments.import_pdf(user_id, parent_key, output)
+            except Exception as exc:  # noqa: BLE001 - preserve the next queue item
+                row["status"] = "failed"
+                row["last_error"] = settings.redact(str(exc))[:MAX_ERROR_LENGTH]
+                return (0, 1)
+            row["status"] = "done"
+            row["last_error"] = ""
+            return (1, 0)
+
+        row["status"] = "translating"
         row["last_error"] = ""
+        row["downloaded_at"] = ""
+        row["next_attempt_at"] = ""
+        row["attempt_count"] = str(int(row["attempt_count"]) + 1)
         self.store.write(rows)
+        future = executor.submit(
+            self._translate_pdf,
+            settings,
+            server_url,
+            parent_key,
+            source_key,
+            source_pdf,
+            qps,
+            pool_size,
+        )
+        active_by_slot[slot.slot_id] = future
+        future_slots[future] = slot
+        return None
+
+    def _run_selected(
+        self,
+        rows: list[dict[str, str]],
+        selected: list[int],
+        settings: PDF2ZHSettings,
+        server_url: str,
+        user_id: int,
+        qps: int,
+        pool_size: int,
+        paper_concurrency: int,
+        inter_item_delay: int,
+        retry_delay: int,
+        transient_retries: int,
+        recovered: int,
+    ) -> dict[str, Any]:
+        pending = deque(selected)
+        slots = [WorkerSlot(slot_id=index) for index in range(paper_concurrency)]
+        now = time.time()
+        for slot in slots:
+            self._assign_next(slot, pending, rows, now)
+
+        done = failed = retried = 0
+        active_by_slot: dict[int, Future[TranslationDownload]] = {}
+        future_slots: dict[Future[TranslationDownload], WorkerSlot] = {}
+        with ThreadPoolExecutor(
+            max_workers=paper_concurrency, thread_name_prefix="zotero-translate"
+        ) as executor:
+            while active_by_slot or any(slot.item_index is not None for slot in slots):
+                progressed = False
+                for future in list(future_slots):
+                    if not future.done():
+                        continue
+                    progressed = True
+                    slot = future_slots.pop(future)
+                    active_by_slot.pop(slot.slot_id, None)
+                    if slot.item_index is None:
+                        raise TranslationError("translation slot lost its queue item")
+                    row = rows[slot.item_index]
+                    try:
+                        download = future.result()
+                    except Exception as exc:  # noqa: BLE001 - classify whole-paper failure
+                        row["last_error"] = settings.redact(str(exc))[:MAX_ERROR_LENGTH]
+                        attempts = int(row["attempt_count"])
+                        if (
+                            is_transient_translation_error(exc)
+                            and attempts <= transient_retries
+                        ):
+                            row["status"] = "retry_wait"
+                            slot.ready_at = time.time() + retry_delay
+                            row["next_attempt_at"] = utc_timestamp(slot.ready_at)
+                            retried += 1
+                            self.store.write(rows)
+                            continue
+                        row["status"] = "failed"
+                        row["next_attempt_at"] = ""
+                        failed += 1
+                        slot.item_index = None
+                        self._assign_next(slot, pending, rows, time.time())
+                        self.store.write(rows)
+                        continue
+
+                    row["output_pdf"] = str(download.output)
+                    row["downloaded_at"] = download.downloaded_at
+                    row["next_attempt_at"] = ""
+                    source_pdf = self.zotero.source_pdf(
+                        row["parent_item_key"], row["source_attachment_key"]
+                    )
+                    try:
+                        output = self._normalize_output(source_pdf, download.output)
+                        row["output_pdf"] = str(output)
+                        row["status"] = "importing"
+                        self.store.write(rows)
+                        self.attachments.import_pdf(
+                            user_id, row["parent_item_key"], output
+                        )
+                    except Exception as exc:  # noqa: BLE001 - import failure stays resumable
+                        row["status"] = "failed"
+                        row["last_error"] = settings.redact(str(exc))[:MAX_ERROR_LENGTH]
+                        failed += 1
+                    else:
+                        row["status"] = "done"
+                        row["last_error"] = ""
+                        done += 1
+                    downloaded_at = parse_queue_timestamp(
+                        row["downloaded_at"], field="downloaded_at"
+                    )
+                    slot.item_index = None
+                    self._assign_next(
+                        slot,
+                        pending,
+                        rows,
+                        (downloaded_at or time.time()) + inter_item_delay,
+                    )
+                    self.store.write(rows)
+
+                current = time.time()
+                ready_slots = sorted(
+                    (
+                        slot
+                        for slot in slots
+                        if slot.item_index is not None
+                        and slot.slot_id not in active_by_slot
+                        and slot.ready_at <= current
+                    ),
+                    key=lambda slot: self._ready_slot_priority(slot, rows),
+                )
+                for slot in ready_slots:
+                    progressed = True
+                    immediate = self._start_slot(
+                        rows,
+                        slot,
+                        settings,
+                        server_url,
+                        user_id,
+                        qps,
+                        pool_size,
+                        executor,
+                        active_by_slot,
+                        future_slots,
+                    )
+                    if immediate is None:
+                        continue
+                    item_done, item_failed = immediate
+                    done += item_done
+                    failed += item_failed
+                    slot.item_index = None
+                    self._assign_next(slot, pending, rows, time.time())
+                    self.store.write(rows)
+
+                if progressed:
+                    continue
+                ready_times = [
+                    slot.ready_at
+                    for slot in slots
+                    if slot.item_index is not None
+                    and slot.slot_id not in active_by_slot
+                ]
+                timeout = (
+                    max(0.0, min(ready_times) - time.time()) if ready_times else None
+                )
+                if future_slots:
+                    wait(
+                        tuple(future_slots),
+                        timeout=timeout,
+                        return_when=FIRST_COMPLETED,
+                    )
+                elif timeout is not None:
+                    time.sleep(timeout)
+
+        return {
+            "selected": len(selected),
+            "done": done,
+            "failed": failed,
+            "retried": retried,
+            "recovered_as_failed": recovered,
+            "service": settings.service,
+            "model": settings.model,
+            "paper_concurrency": paper_concurrency,
+            "qps_per_paper": qps,
+            "pool_size_per_paper": pool_size,
+            "nominal_peak_qps": qps * paper_concurrency,
+            "nominal_peak_pool_size": pool_size * paper_concurrency,
+            "inter_item_delay": inter_item_delay,
+            "retry_delay": retry_delay,
+            "transient_retries": transient_retries,
+        }
 
 
 def doctor(prefs_path: Path | None = None) -> dict[str, Any]:
@@ -2069,6 +2463,10 @@ def schedule_translation(
     queue: Path,
     qps: int,
     pool_size: int,
+    paper_concurrency: int,
+    inter_item_delay: int,
+    retry_delay: int,
+    transient_retries: int,
     max_items: int,
     prefs_path: Path | None = None,
 ) -> dict[str, Any]:
@@ -2084,6 +2482,14 @@ def schedule_translation(
         str(qps),
         "--pool-size",
         str(pool_size),
+        "--paper-concurrency",
+        str(paper_concurrency),
+        "--inter-item-delay",
+        str(inter_item_delay),
+        "--retry-delay",
+        str(retry_delay),
+        "--transient-retries",
+        str(transient_retries),
         "--max-items",
         str(max_items),
     ]
@@ -2157,6 +2563,10 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--prefs", type=Path)
     run.add_argument("--qps", type=positive_int, required=True)
     run.add_argument("--pool-size", type=positive_int, required=True)
+    run.add_argument("--paper-concurrency", type=positive_int, required=True)
+    run.add_argument("--inter-item-delay", type=nonnegative_int, required=True)
+    run.add_argument("--retry-delay", type=nonnegative_int, required=True)
+    run.add_argument("--transient-retries", type=nonnegative_int, required=True)
     run.add_argument("--max-items", type=positive_int, required=True)
     run.add_argument("--dry-run", action="store_true")
 
@@ -2177,6 +2587,10 @@ def _parser() -> argparse.ArgumentParser:
     schedule.add_argument("--prefs", type=Path)
     schedule.add_argument("--qps", type=positive_int, required=True)
     schedule.add_argument("--pool-size", type=positive_int, required=True)
+    schedule.add_argument("--paper-concurrency", type=positive_int, required=True)
+    schedule.add_argument("--inter-item-delay", type=nonnegative_int, required=True)
+    schedule.add_argument("--retry-delay", type=nonnegative_int, required=True)
+    schedule.add_argument("--transient-retries", type=nonnegative_int, required=True)
     schedule.add_argument("--max-items", type=positive_int, required=True)
     return parser
 
@@ -2204,6 +2618,10 @@ def main(argv: list[str] | None = None) -> int:
                 arguments.queue,
                 arguments.qps,
                 arguments.pool_size,
+                arguments.paper_concurrency,
+                arguments.inter_item_delay,
+                arguments.retry_delay,
+                arguments.transient_retries,
                 arguments.max_items,
                 arguments.prefs,
             )
@@ -2231,7 +2649,11 @@ def main(argv: list[str] | None = None) -> int:
                     arguments.qps,
                     arguments.pool_size,
                     arguments.max_items,
-                    arguments.dry_run,
+                    paper_concurrency=arguments.paper_concurrency,
+                    inter_item_delay=arguments.inter_item_delay,
+                    retry_delay=arguments.retry_delay,
+                    transient_retries=arguments.transient_retries,
+                    dry_run=arguments.dry_run,
                 )
     except (
         TranslationError,

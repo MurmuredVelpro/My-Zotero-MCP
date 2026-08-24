@@ -76,7 +76,6 @@ storage = "D:\\Zotero\\storage"
 
 [mineru]
 output_dir = "D:\\Zotero_MinerU"
-ledger = "D:\\Zotero_MinerU\\mineru_todo.csv"
 
 [qmd]
 command = "qmd"
@@ -89,7 +88,15 @@ auto_rename_manual = false
 rename_poll_seconds = 30
 ```
 
-Secrets are stored in separate private files, not in this TOML.
+Secrets are stored in separate private files, not in this TOML. On WSL/Linux,
+the defaults are `~/.config/zotero-mcp/zotero_web_api_key.secret`,
+`~/.config/mineru/mineru_api_token.secret`, and
+`~/.config/zotero-mcp/sciverse_api_token.secret`. Each is a UTF-8 plain-text
+file containing only one secret line, written with mode `0600`. The `.secret`
+suffix is a naming convention, not an encryption format. Use
+`ZOTERO_API_KEY_FILE`, `MINERU_API_TOKEN_FILE`, `SCIVERSE_API_TOKEN_FILE`,
+`zotero.api_key_file`, `mineru.token_file`, or `sciverse.token_file` when a
+different path is required.
 
 ## 5. Configure optional integrations
 
@@ -114,7 +121,20 @@ The command reads the official Zotero preferences and Zotero MCP naming configur
 
 Translation attachment titles and filenames are configurable under `[translation]`; the generated values above preserve the default behavior. `filename_template` must contain and may only use `{source_stem}`, and it must render one `.pdf` filename. Users who want Zotero's manual translation command to produce consistently named attachments can opt into the background rename monitor described in [TRANSLATION.md](TRANSLATION.md#optional-automatic-mode). The setting is disabled by default and the first scan establishes a checkpoint without changing historical attachments.
 
-## 6. Add MCP servers to Codex
+## 6. Initialize workflow tracking
+
+The workflow database is SQLite-only. It tracks the recursive collections you name; it does not assume project-specific collection names. On first setup, repeat `--collection` for every collection that should be tracked:
+
+```bash
+python -m zotero_mcp.zotero_workflow sync \
+  --collection Senescence \
+  --collection "Journal Club" \
+  --collection Glioma
+```
+
+Later, `zotero_workflow sync` without `--collection` reuses those saved roots. Tracking and processing are separate: select one collection for a review or batch with `next-batch --collection NAME --limit 5`. MinerU batch receipts and item state stay in `zotero_workflow.sqlite3`; the workflow does not restore or generate `mineru_todo.csv` or `.jobs` files. An explicit `export-csv` remains available as a read-only report export.
+
+## 7. Add MCP servers to Codex
 
 Generate configuration from the same Python environment used above:
 
@@ -129,9 +149,16 @@ Merge the printed blocks into the existing Codex config:
 
 The output contains three independent MCP servers: Zotero, QMD, and SciVerse. Remove or disable optional blocks that are not configured. Restart Codex after editing its config.
 
+For document parsing outside Zotero, install the official
+[`mineru-open-mcp`](https://github.com/opendatalab/MinerU-Ecosystem/tree/main/mcp)
+as a fourth independent MCP server. Its `MINERU_API_TOKEN` should be supplied
+at process launch from the private MinerU secret file, not written into Codex
+configuration. Zotero batch parsing uses the official `mineru-open-sdk` and
+keeps its recoverable Zotero/QMD workflow.
+
 For literature discovery, use SciVerse together with the optional [`paper-lookup`](https://github.com/K-Dense-AI/scientific-agent-skills/tree/main/skills/paper-lookup) skill. `setup plan --profile full` detects whether the skill is installed. When it is missing, ask Codex to use its built-in `skill-installer` for repository `K-Dense-AI/scientific-agent-skills`, path `skills/paper-lookup`; installation requires user approval.
 
-## 7. Verify
+## 8. Verify
 
 Run:
 
@@ -163,7 +190,6 @@ Then verify in Codex:
 - `MINERU_API_TOKEN`
 - `MINERU_API_TOKEN_FILE`
 - `ZOTERO_MINERU_DIR`
-- `ZOTERO_MINERU_LEDGER`
 - `QMD_COMMAND`
 - `QMD_COLLECTION`
 - `SCIVERSE_MCP_COMMAND`

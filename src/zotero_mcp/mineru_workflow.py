@@ -4,9 +4,7 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import json
-import os
 import re
 import subprocess
 import sys
@@ -16,21 +14,11 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
-from . import mineru_client, zotero_local, zotero_runtime
+from . import mineru_client, workflow_database, zotero_local
 
 OUTPUT_ROOT = mineru_client.DEFAULT_OUTPUT_ROOT
-STATE_DIR = OUTPUT_ROOT / ".jobs"
-TODO_PATH = (
-    zotero_runtime.configured_path("ZOTERO_MINERU_LEDGER", "mineru", "ledger")
-    or OUTPUT_ROOT / "mineru_todo.csv"
-)
-TODO_FIELDS = (
-    "item_key",
-    "parsed_attachment_key",
-    "has_pdf",
-    "mineru_parsed",
-    "qmd_indexed",
-)
+STAGING_DIR = OUTPUT_ROOT / ".staging"
+WORKFLOW_DATABASE = workflow_database.default_database_path()
 MAX_FILE_BYTES = 200 * 1024 * 1024
 MAX_FILE_PAGES = 200
 
@@ -39,78 +27,36 @@ def utc_now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
 
 
-def load_todo_rows(todo_path: Path | None = None) -> list[dict[str, str]]:
-    todo_path = TODO_PATH if todo_path is None else todo_path
-    if not todo_path.is_file():
-        return []
-    with todo_path.open(encoding="utf-8", newline="") as handle:
-        reader = csv.DictReader(handle)
-        if tuple(reader.fieldnames or ()) != TODO_FIELDS:
-            raise RuntimeError(
-                f"Unexpected todo columns in {todo_path}: {reader.fieldnames}"
-            )
-        return [dict(row) for row in reader]
+def mineru_records_by_key(
+    database: Path | None = None,
+) -> dict[str, dict[str, str]]:
+    return workflow_database.mineru_records_by_key(database or WORKFLOW_DATABASE)
 
 
-def todo_lock_path(todo_path: Path) -> Path:
-    return todo_path.with_name(f".{todo_path.name}.lock")
-
-
-def _save_todo_rows_unlocked(
-    rows: list[dict[str, str]], todo_path: Path | None = None
-) -> None:
-    todo_path = TODO_PATH if todo_path is None else todo_path
-    todo_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = todo_path.with_name(f".{todo_path.name}.{os.getpid()}.tmp")
-    try:
-        with temporary.open("w", encoding="utf-8", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=TODO_FIELDS)
-            writer.writeheader()
-            writer.writerows(rows)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, todo_path)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-def todo_rows_by_key(todo_path: Path | None = None) -> dict[str, dict[str, str]]:
-    return {row["item_key"]: row for row in load_todo_rows(todo_path)}
-
-
-def update_todo_row(
+def update_mineru_record(
     item_key: str,
     updates: dict[str, str],
-    todo_path: Path | None = None,
+    database: Path | None = None,
 ) -> bool:
-    todo_path = TODO_PATH if todo_path is None else todo_path
-    with zotero_runtime.exclusive_file_lock(todo_lock_path(todo_path)):
-        rows = load_todo_rows(todo_path)
-        row = next((record for record in rows if record["item_key"] == item_key), None)
-        if row is None:
-            return False
-        changed = any(row.get(field) != value for field, value in updates.items())
-        if not changed:
-            return False
-        row.update(updates)
-        _save_todo_rows_unlocked(rows, todo_path)
-        return True
-
-
-def mark_todo_stale(item_key: str, todo_path: Path | None = None) -> bool:
-    return update_todo_row(
-        item_key,
-        {"has_pdf": "true", "mineru_parsed": "false", "qmd_indexed": "false"},
-        todo_path,
+    return workflow_database.update_mineru_record(
+        item_key, updates, database or WORKFLOW_DATABASE
     )
 
 
-def mark_todo_parsed(
+def mark_mineru_stale(item_key: str, database: Path | None = None) -> bool:
+    return update_mineru_record(
+        item_key,
+        {"has_pdf": "true", "mineru_parsed": "false", "qmd_indexed": "false"},
+        database,
+    )
+
+
+def mark_mineru_parsed(
     item_key: str,
     attachment_key: str,
-    todo_path: Path | None = None,
+    database: Path | None = None,
 ) -> bool:
-    return update_todo_row(
+    return update_mineru_record(
         item_key,
         {
             "parsed_attachment_key": attachment_key,
@@ -118,54 +64,29 @@ def mark_todo_parsed(
             "mineru_parsed": "true",
             "qmd_indexed": "false",
         },
-        todo_path,
+        database,
     )
 
 
-def todo_keys_needing_qmd(todo_path: Path | None = None) -> list[str]:
-    return [
-        row["item_key"]
-        for row in load_todo_rows(todo_path)
-        if row["mineru_parsed"] == "true" and row["qmd_indexed"] != "true"
-    ]
+def mineru_keys_needing_qmd(database: Path | None = None) -> list[str]:
+    return workflow_database.mineru_keys_needing_qmd(database or WORKFLOW_DATABASE)
 
 
-def mark_todo_qmd_indexed(
+def mark_mineru_qmd_indexed(
     item_keys: list[str] | None = None,
-    todo_path: Path | None = None,
+    database: Path | None = None,
 ) -> list[str]:
-    todo_path = TODO_PATH if todo_path is None else todo_path
-    with zotero_runtime.exclusive_file_lock(todo_lock_path(todo_path)):
-        rows = load_todo_rows(todo_path)
-        targets = (
-            {
-                row["item_key"]
-                for row in rows
-                if row["mineru_parsed"] == "true" and row["qmd_indexed"] != "true"
-            }
-            if item_keys is None
-            else set(item_keys)
-        )
-        changed = []
-        for row in rows:
-            if (
-                row["item_key"] in targets
-                and row["mineru_parsed"] == "true"
-                and row["qmd_indexed"] != "true"
-            ):
-                row["qmd_indexed"] = "true"
-                changed.append(row["item_key"])
-        if changed:
-            _save_todo_rows_unlocked(rows, todo_path)
-        return changed
+    return workflow_database.mark_mineru_qmd_indexed(
+        item_keys, database or WORKFLOW_DATABASE
+    )
 
 
 def tracked_result_status(
     item_key: str,
     current_attachment_key: str,
-    todo_path: Path | None = None,
+    database: Path | None = None,
 ) -> str:
-    row = todo_rows_by_key(todo_path).get(item_key)
+    row = mineru_records_by_key(database).get(item_key)
     if row is None:
         return "untracked"
     if (
@@ -176,90 +97,24 @@ def tracked_result_status(
     return "stale"
 
 
-def sync_todo_from_plan(
-    plan: dict[str, Any], todo_path: Path | None = None
+def sync_mineru_records_from_plan(
+    plan: dict[str, Any], database: Path | None = None
 ) -> list[str]:
-    todo_path = TODO_PATH if todo_path is None else todo_path
-    with zotero_runtime.exclusive_file_lock(todo_lock_path(todo_path)):
-        rows = load_todo_rows(todo_path)
-        by_key = {row["item_key"]: row for row in rows}
-        added = []
-        changed = False
-        for status in ("existing", "ready", "blocked", "missing"):
-            has_pdf = "false" if status == "missing" else "true"
-            for record in plan[status]:
-                item_key = str(record["data_id"])
-                row = by_key.get(item_key)
-                if row is None:
-                    row = {
-                        "item_key": item_key,
-                        "parsed_attachment_key": "",
-                        "has_pdf": has_pdf,
-                        "mineru_parsed": "false",
-                        "qmd_indexed": "false",
-                    }
-                    rows.append(row)
-                    by_key[item_key] = row
-                    added.append(item_key)
-                    changed = True
-                elif row["has_pdf"] != has_pdf:
-                    row["has_pdf"] = has_pdf
-                    if has_pdf == "false":
-                        row["mineru_parsed"] = "false"
-                        row["qmd_indexed"] = "false"
-                    changed = True
-        if changed:
-            rows.sort(key=lambda row: row["item_key"])
-            _save_todo_rows_unlocked(rows, todo_path)
-        return added
+    return workflow_database.sync_mineru_records_from_plan(
+        plan, database or WORKFLOW_DATABASE
+    )
 
 
-def state_path(batch_id: str, state_dir: Path | None = None) -> Path:
-    state_dir = STATE_DIR if state_dir is None else state_dir
-    if not re.fullmatch(r"[A-Za-z0-9_-]+", batch_id):
-        raise ValueError(f"Invalid batch_id: {batch_id}")
-    return state_dir / f"{batch_id}.json"
+def save_state(state: dict[str, Any], database: Path | None = None) -> Path:
+    return workflow_database.save_mineru_batch(state, database or WORKFLOW_DATABASE)
 
 
-def save_state(state: dict[str, Any], state_dir: Path | None = None) -> Path:
-    state_dir = STATE_DIR if state_dir is None else state_dir
-    batch_id = str(state.get("batch_id", ""))
-    target = state_path(batch_id, state_dir)
-    state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if os.name != "nt":
-        state_dir.chmod(0o700)
-    state["updated_at"] = utc_now()
-    temporary = state_dir / f".{batch_id}.{os.getpid()}.tmp"
-    try:
-        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            json.dump(state, handle, ensure_ascii=False, indent=2)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, target)
-        if os.name != "nt":
-            target.chmod(0o600)
-    finally:
-        temporary.unlink(missing_ok=True)
-    return target
+def load_state(batch_id: str, database: Path | None = None) -> dict[str, Any]:
+    return workflow_database.load_mineru_batch(batch_id, database or WORKFLOW_DATABASE)
 
 
-def load_state(batch_id: str, state_dir: Path | None = None) -> dict[str, Any]:
-    state_dir = STATE_DIR if state_dir is None else state_dir
-    if batch_id == "latest":
-        candidates = sorted(
-            state_dir.glob("*.json"), key=lambda path: path.stat().st_mtime
-        )
-        if not candidates:
-            raise FileNotFoundError(f"No MinerU batch state found under {state_dir}")
-        path = candidates[-1]
-    else:
-        path = state_path(batch_id, state_dir)
-    state = json.loads(path.read_text(encoding="utf-8"))
-    if state.get("batch_id") != path.stem:
-        raise ValueError(f"Batch state does not match its filename: {path}")
-    return state
+def list_states(database: Path | None = None) -> list[dict[str, Any]]:
+    return workflow_database.list_mineru_batches(database or WORKFLOW_DATABASE)
 
 
 def pdf_page_count(pdf: Path) -> int:
@@ -289,16 +144,17 @@ def collection_plan(collection_key: str, recursive: bool = False) -> dict[str, A
         "collection_key": collection_key,
         "ready": [],
         "existing": [],
+        "untracked_existing": [],
         "missing": [],
         "blocked": [],
     }
-    todo = todo_rows_by_key()
+    mineru_records = mineru_records_by_key()
     for item in items:
         data = item.get("data", {})
         key = str(data.get("key") or item.get("key", "")).strip()
         title = str(data.get("title", "")).strip()
         existing = mineru_client.find_local_result(key)
-        tracked = todo.get(key)
+        tracked = mineru_records.get(key)
         parsed_attachment_key = (
             str(tracked.get("parsed_attachment_key") or "") if tracked else ""
         )
@@ -323,6 +179,16 @@ def collection_plan(collection_key: str, recursive: bool = False) -> dict[str, A
             continue
         pages = pdf_page_count(pdf)
         size_bytes = pdf.stat().st_size
+        plan_status = (
+            "untracked_existing"
+            if existing and tracked is None
+            else (
+                "stale"
+                if parsed_attachment_key
+                and parsed_attachment_key != str(attachment["key"])
+                else "ready"
+            )
+        )
         record = {
             "data_id": key,
             "title": title,
@@ -333,23 +199,21 @@ def collection_plan(collection_key: str, recursive: bool = False) -> dict[str, A
             "pages": pages,
             "size_bytes": size_bytes,
             "replace_existing": bool(existing),
-            "plan_status": (
-                "untracked"
-                if existing and tracked is None
-                else (
-                    "stale"
-                    if parsed_attachment_key
-                    and parsed_attachment_key != str(attachment["key"])
-                    else "ready"
-                )
-            ),
+            "plan_status": plan_status,
         }
         reasons = []
         if pages > MAX_FILE_PAGES:
             reasons.append(f"{pages} pages exceeds {MAX_FILE_PAGES}")
         if size_bytes > MAX_FILE_BYTES:
             reasons.append(f"{size_bytes} bytes exceeds {MAX_FILE_BYTES}")
-        if reasons:
+        if plan_status == "untracked_existing":
+            record["reason"] = (
+                "complete local MinerU result exists without a SQLite state record; "
+                "adopt explicitly before submitting"
+            )
+            plan["untracked_existing"].append(record)
+            plan["blocked"].append(record)
+        elif reasons:
             record["reason"] = "; ".join(reasons)
             plan["blocked"].append(record)
         else:
@@ -383,13 +247,14 @@ def print_plan(plan: dict[str, Any]) -> None:
             )
     print(
         "SUMMARY collection={} items={} ready={} stale={} pages={} existing={} "
-        "missing={} blocked={}".format(
+        "untracked_existing={} missing={} blocked={}".format(
             plan["collection_key"],
             plan["item_count"],
             len(plan["ready"]),
             sum(record.get("plan_status") == "stale" for record in plan["ready"]),
             plan["ready_pages"],
             len(plan["existing"]),
+            len(plan.get("untracked_existing", [])),
             len(plan["missing"]),
             len(plan["blocked"]),
         ),
@@ -485,8 +350,92 @@ def verify_result_dir(output_dir: Path) -> dict[str, Any]:
     }
 
 
+def adopt_existing_plan(
+    item_key: str,
+    attachment_key: str,
+    database: Path | None = None,
+) -> dict[str, Any]:
+    item_key = item_key.strip()
+    attachment_key = attachment_key.strip()
+    if not item_key or not attachment_key:
+        raise ValueError("item_key and attachment_key are required")
+    selected_database = (database or WORKFLOW_DATABASE).expanduser()
+    if workflow_database.has_mineru_record(item_key, selected_database):
+        raise RuntimeError(f"MinerU state already exists for item: {item_key}")
+
+    output_dir = (OUTPUT_ROOT / item_key).expanduser().resolve()
+    verification = verify_result_dir(output_dir)
+    item = zotero_local.get_item(item_key)
+    data = item.get("data") or {}
+    actual_item_key = str(data.get("key") or item.get("key") or "")
+    if actual_item_key != item_key:
+        raise RuntimeError(
+            f"Zotero item key mismatch: requested {item_key}, got {actual_item_key}"
+        )
+    attachments = zotero_local.pdf_attachments_for_item(item)
+    attachment = next(
+        (row for row in attachments if str(row.get("key")) == attachment_key), None
+    )
+    if attachment is None:
+        raise RuntimeError(
+            f"指定附件不是当前 Zotero 中可用的本地 PDF: {attachment_key}"
+        )
+    if zotero_local.has_translation_marker(
+        str(attachment.get("title") or ""), str(attachment.get("filename") or "")
+    ):
+        raise RuntimeError(f"指定附件看起来是译文而非英文源 PDF: {attachment_key}")
+    source_pdf = Path(str(attachment["path"])).expanduser().resolve()
+    cjk_share, letters = zotero_local.pdf_text_language_stats(source_pdf)
+    if letters < 200 or cjk_share >= zotero_local.ENGLISH_PDF_MAX_CJK_SHARE:
+        raise RuntimeError(
+            f"指定附件未通过英文正文检查: {attachment_key} "
+            f"letters={letters} cjk_share={cjk_share:.3f}"
+        )
+    source_pages = pdf_page_count(source_pdf)
+    origin_pages = pdf_page_count(output_dir / "origin.pdf")
+    if source_pages != origin_pages:
+        raise RuntimeError(
+            f"source/origin page count mismatch: source={source_pages} "
+            f"origin={origin_pages}"
+        )
+    return {
+        "item_key": item_key,
+        "attachment_key": attachment_key,
+        "source_pdf": str(source_pdf),
+        "output_dir": str(output_dir),
+        "source_pages": source_pages,
+        "origin_pages": origin_pages,
+        "verification": verification,
+        "status": "ready",
+    }
+
+
+def adopt_existing(
+    plan: dict[str, Any], database: Path | None = None
+) -> dict[str, Any]:
+    if plan.get("status") != "ready":
+        raise RuntimeError("adopt-existing plan is not ready")
+    workflow_database.adopt_mineru_record(
+        str(plan["item_key"]), str(plan["attachment_key"]), database
+    )
+    return {**plan, "status": "adopted", "qmd_indexed": False}
+
+
 def cmd_plan(arguments: argparse.Namespace) -> int:
     print_plan(collection_plan(arguments.collection_key, arguments.recursive))
+    return 0
+
+
+def cmd_adopt_existing(arguments: argparse.Namespace) -> int:
+    database = Path(getattr(arguments, "database", WORKFLOW_DATABASE))
+    plan = adopt_existing_plan(
+        arguments.item_key,
+        arguments.attachment_key,
+        database,
+    )
+    if arguments.confirm:
+        plan = adopt_existing(plan, database)
+    print(json.dumps(plan, ensure_ascii=False, indent=2))
     return 0
 
 
@@ -499,9 +448,19 @@ def submit_selected_batch(
 ) -> tuple[dict[str, Any], list[str]]:
     if not selected:
         raise RuntimeError("No eligible PDF fits the requested batch limits")
+    untracked = [
+        record["data_id"]
+        for record in selected
+        if record.get("plan_status") in {"untracked", "untracked_existing"}
+    ]
+    if untracked:
+        raise RuntimeError(
+            "Cannot submit untracked existing MinerU results; adopt first: "
+            + ", ".join(untracked)
+        )
     for record in selected:
-        if record.get("plan_status") in {"stale", "untracked"}:
-            mark_todo_stale(record["data_id"])
+        if record.get("plan_status") == "stale":
+            mark_mineru_stale(record["data_id"])
     specs = [
         {"name": record["name"], "data_id": record["data_id"], "is_ocr": False}
         for record in selected
@@ -558,7 +517,7 @@ def submit_selected_batch(
 
 def cmd_submit_batch(arguments: argparse.Namespace) -> int:
     plan = collection_plan(arguments.collection_key, arguments.recursive)
-    sync_todo_from_plan(plan)
+    sync_mineru_records_from_plan(plan)
     print_plan(plan)
     selected, deferred = select_batch(
         plan["ready"], arguments.max_files, arguments.max_pages
@@ -610,7 +569,7 @@ def collect_batch(batch_id: str) -> tuple[dict[str, Any], int]:
                 )
             output_dir = OUTPUT_ROOT / record["data_id"]
             if record.get("replace_existing") and output_dir.is_dir():
-                batch_dir = STATE_DIR / state["batch_id"]
+                batch_dir = STAGING_DIR / state["batch_id"]
                 staged_dir = batch_dir / record["data_id"]
                 mineru_client.download_and_extract(full_zip_url, staged_dir)
                 verify_result_dir(staged_dir)
@@ -627,7 +586,7 @@ def collect_batch(batch_id: str) -> tuple[dict[str, Any], int]:
         if result_state == "done" and record.get("downloaded"):
             attachment_key = str(record.get("attachment_key") or "")
             if attachment_key:
-                mark_todo_parsed(record["data_id"], attachment_key)
+                mark_mineru_parsed(record["data_id"], attachment_key)
         print(
             f"RESULT {record['data_id']} state={result_state} "
             f"downloaded={str(bool(record.get('downloaded'))).lower()}",
@@ -689,6 +648,15 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument("collection_key")
     plan.add_argument("--recursive", action="store_true")
     plan.set_defaults(handler=cmd_plan)
+
+    adopt = commands.add_parser(
+        "adopt-existing", help="Adopt one existing MinerU result into SQLite"
+    )
+    adopt.add_argument("item_key")
+    adopt.add_argument("--attachment-key", required=True)
+    adopt.add_argument("--database", type=Path, default=WORKFLOW_DATABASE)
+    adopt.add_argument("--confirm", action="store_true")
+    adopt.set_defaults(handler=cmd_adopt_existing)
 
     submit = commands.add_parser(
         "submit-batch", help="Create and upload one recoverable MinerU batch"

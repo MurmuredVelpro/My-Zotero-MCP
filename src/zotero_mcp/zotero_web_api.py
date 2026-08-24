@@ -9,7 +9,6 @@ import threading
 import time
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
-from pathlib import Path
 from typing import Any
 
 import requests
@@ -17,7 +16,7 @@ import requests
 from . import zotero_runtime
 
 DEFAULT_WEB_API_BASE = "https://api.zotero.org"
-LEGACY_WEB_API_KEY_FILE = Path(__file__).resolve().parent / "zotero_web_api_key"
+DEFAULT_WEB_API_KEY_FILE = "zotero_web_api_key.secret"
 WEB_API_VERSION = "3"
 USER_AGENT = "zotero-mcp-local"
 READ_RETRY_STATUSES = {429, 503}
@@ -116,19 +115,12 @@ def web_api_key() -> str:
     configured = zotero_runtime.configured_path(
         "ZOTERO_API_KEY_FILE", "zotero", "api_key_file"
     )
-    candidates = (
-        [configured]
-        if configured
-        else [
-            zotero_runtime.default_secret_path("zotero_web_api_key"),
-            LEGACY_WEB_API_KEY_FILE,
-        ]
+    key_file = configured or zotero_runtime.default_secret_path(
+        DEFAULT_WEB_API_KEY_FILE
     )
-    key_file = next((path for path in candidates if path.is_file()), None)
-    if key_file is None:
-        expected = configured or candidates[0]
+    if not key_file.is_file():
         raise ZoteroWriteError(
-            f"Zotero Web API key not found. Set ZOTERO_API_KEY or create {expected}."
+            f"Zotero Web API key not found. Set ZOTERO_API_KEY or create {key_file}."
         )
     mode = stat.S_IMODE(key_file.stat().st_mode)
     if os.name != "nt" and mode & 0o077:

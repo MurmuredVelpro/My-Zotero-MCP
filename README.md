@@ -55,6 +55,7 @@ zotero-mcp setup plan --profile full
 - 读取批注、笔记、PDF 全文、页面与 Better BibTeX citation key
 - 通过 plan/apply 两阶段工具导入论文、调整 collection、删除 PDF 附件
 - 可选使用 MinerU 批量解析 PDF，并用 QMD 建立全文检索
+- 用本地 SQLite 记录重点 collection 的翻译、MinerU、QMD 和运行健康状态，供不同对话共享
 - 在用户现有 collection 标准下，用 QMD 全文证据协同规划和执行文献整理
 - 调用官方 PDF2zh Server 批量翻译全文，按用户配置自动命名、下载并导入译文附件；默认标题为 `CN`，文件名为“英文原文件名的全文翻译.pdf”
 - 按 toolset 控制暴露给 Agent 的工具
@@ -117,15 +118,61 @@ zotero-mcp setup print-codex-config --toolsets literature,review,maintenance
 
 完整文献工作流保持四段独立边界：SciVerse 与 `paper-lookup` 互补检索候选，Zotero 查重并经 plan/apply 导入，MinerU 解析已确认的 PDF，QMD 更新索引并回读核验。任何外部上传或 Zotero 写入都需要单独批准。
 
+## Zotero 工作流状态库
+
+SQLite 是跨对话共享的工作流状态库，不是 Zotero 数据库，也不替代翻译队列或 QMD。它同时保存当前状态快照、MinerU 解析来源和可恢复批次回执。跟踪范围由用户初始化时指定，可同时跟踪多个递归 collection；每次 `next-batch` 或实际处理仍只针对一个明确 collection。
+
+唯一运行状态文件：`~/.local/state/zotero-mcp/zotero_workflow.sqlite3`。CSV 不是运行状态；只有显式执行 `export-csv` 时才生成平面视图。
+
+首次初始化时显式指定全部需要跟踪的 collection：
+
+```bash
+python -m zotero_mcp.zotero_workflow sync \
+  --collection Senescence \
+  --collection "Journal Club" \
+  --collection Glioma
+```
+
+之后状态变化后可无参数复用已保存的跟踪范围：
+
+```bash
+python -m zotero_mcp.zotero_workflow sync
+```
+
+只处理一个 collection：
+
+```bash
+python -m zotero_mcp.zotero_workflow next-batch --collection Senescence --limit 5
+```
+
+查询汇总或单条论文：
+
+```bash
+python -m zotero_mcp.zotero_workflow status
+python -m zotero_mcp.zotero_workflow status --item ITEMKEY
+python -m zotero_mcp.zotero_workflow export-csv
+```
+
+同步只写入上述本地 SQLite，不修改 Zotero、PDF、MinerU、QMD 或 PDF2zh，不提交翻译任务。`export-csv` 是显式的只读导出，不参与状态恢复。`role=source_pdf`、`translated_pdf`、`supplementary_pdf` 是工作流判断；`is_primary` 只表示 Zotero 的主附件提示，不能单独用来判断英文正文。
+
 ## 协同整理 collection
 
 QMD 建立全文索引后，Codex 可以读取用户现有分类规则，逐篇回读全文，生成 collection 调整计划。用户审阅后，工具再通过 plan/apply 两阶段执行并回读。
+
+同一连续审核对话内，已完成且仍有效的父条目、英文 PDF、MinerU 和 QMD 预检可以复用；不因用户批准或批次衔接再次逐篇实时复核。只有发现外部状态变化、附件更换、预检失效、计划与当前状态不一致或用户明确要求时，才重新扫描。plan/apply 自身的云端冲突检查和写后回读仍必须执行。
 
 通用流程见 [docs/COLLECTION_REVIEW.md](docs/COLLECTION_REVIEW.md)，基础记录模板见 [templates/collection_review.md](templates/collection_review.md)。
 
 ## PDF 全文翻译
 
 用户先从官方项目安装并在 Zotero 图形界面配置 [Zotero PDF2zh](https://github.com/guaguastandup/zotero-pdf2zh)。本项目直接读取该图形界面保存的激活服务、模型和 Server 地址；API key 不进入命令行、队列、日志或仓库。
+
+提交或检查翻译前先刷新状态库，确认目标条目没有活动任务或已有译文：
+
+```bash
+python -m zotero_mcp.zotero_workflow sync
+python -m zotero_mcp.zotero_workflow status --item ITEMKEY
+```
 
 ```bash
 zotero-mcp setup save-secret webdav
@@ -156,7 +203,11 @@ filename_template = "{source_stem}的全文翻译.pdf"
 
 可用 `ZOTERO_MCP_CONFIG` 指定配置文件，或用 `ZOTERO_MCP_CONFIG_DIR` 指定配置目录。环境变量与完整配置项见 [docs/SETUP.md](docs/SETUP.md)。
 
+Zotero Web API key 默认保存在 Zotero MCP 配置目录下的 `zotero_web_api_key.secret`；MinerU Token 独立保存在 `~/.config/mineru/mineru_api_token.secret`。它们是仅含单行密钥的 UTF-8 纯文本文件，不是加密格式；WSL/Linux 下默认权限为 `0600`。使用 `zotero-mcp setup save-secret zotero` 或 `zotero-mcp setup save-secret mineru` 通过隐藏输入保存，不要把密钥写入仓库或提交到 Git。
+
 ## MinerU 批处理
+
+Zotero 批处理通过官方 `mineru-open-sdk` 访问 MinerU，同时保留可恢复上传、Zotero item-key 目录、产物验证和 QMD 流水线。通用文件解析应另行安装官方 `mineru-open-mcp`，作为独立 MCP 使用；它与下列 Zotero 专用命令互不替代。
 
 单批预检与提交：
 
@@ -173,7 +224,16 @@ MinerU 与 QMD 的有界流水线：
 zotero-mineru-qmd <collection-key> --recursive --page-budget 1000 --max-files 20
 ```
 
-批次状态保存在 MinerU 输出目录的 `.jobs` 中。ledger 默认是同目录下的 `mineru_todo.csv`，也可通过配置项 `mineru.ledger` 或环境变量 `ZOTERO_MINERU_LEDGER` 指定。
+MinerU 论文状态和批次回执保存在 `~/.local/state/zotero-mcp/zotero_workflow.sqlite3`。不使用或生成 `mineru_todo.csv`、`.jobs` 或其他批次状态文件。替换旧解析结果时，下载内容临时放在 MinerU 输出目录的 `.staging` 中。
+
+如果发现已有完整解析目录但 SQLite 没有记录，预检会将其标为 `untracked_existing` 并阻止重新上传。先核对当前英文附件，再显式认领：
+
+```bash
+zotero-mineru adopt-existing ITEMKEY --attachment-key ATTACHMENTKEY
+zotero-mineru adopt-existing ITEMKEY --attachment-key ATTACHMENTKEY --confirm
+```
+
+认领只写入 SQLite，随后仍需正常 QMD 更新、嵌入和核验。
 
 ## 测试
 

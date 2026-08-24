@@ -1,10 +1,8 @@
-import csv
 import json
 import os
 import stat
 import tempfile
 import threading
-import time
 import unittest
 import zipfile
 from pathlib import Path
@@ -15,11 +13,26 @@ from zotero_mcp import mineru_workflow
 
 
 class MinerUWorkflowTests(unittest.TestCase):
-    def write_todo(self, path, rows):
-        with path.open("w", encoding="utf-8", newline="") as handle:
-            writer = csv.DictWriter(handle, fieldnames=mineru_workflow.TODO_FIELDS)
-            writer.writeheader()
-            writer.writerows(rows)
+    def write_mineru_records(self, database, rows):
+        with mineru_workflow.workflow_database.connect(database) as connection:
+            connection.executemany(
+                """
+                INSERT INTO mineru_item_state(
+                    item_key, parsed_attachment_key, has_pdf,
+                    mineru_parsed, qmd_indexed, updated_at
+                ) VALUES(:item_key, :parsed_attachment_key, :has_pdf,
+                         :mineru_parsed, :qmd_indexed, '2026-08-20T00:00:00+00:00')
+                """,
+                [
+                    {
+                        **row,
+                        "has_pdf": int(row["has_pdf"] == "true"),
+                        "mineru_parsed": int(row["mineru_parsed"] == "true"),
+                        "qmd_indexed": int(row["qmd_indexed"] == "true"),
+                    }
+                    for row in rows
+                ],
+            )
 
     def plan_single_pdf(self, pdf, attachment_key, tracked=None):
         item = {"data": {"key": "ITEM1", "title": "Paper"}}
@@ -38,7 +51,7 @@ class MinerUWorkflowTests(unittest.TestCase):
                 return_value=([item], {}),
             ),
             mock.patch.object(
-                mineru_workflow, "todo_rows_by_key", return_value=tracked or {}
+                mineru_workflow, "mineru_records_by_key", return_value=tracked or {}
             ),
             mock.patch.object(
                 mineru_workflow.zotero_local,
@@ -76,25 +89,26 @@ class MinerUWorkflowTests(unittest.TestCase):
                 "collect_collection_items",
                 return_value=([], {}),
             ) as collect_items,
-            mock.patch.object(mineru_workflow, "todo_rows_by_key", return_value={}),
+            mock.patch.object(
+                mineru_workflow, "mineru_records_by_key", return_value={}
+            ),
         ):
             mineru_workflow.collection_plan("COLLECTION1", recursive=True)
         collect_items.assert_called_once_with("COLLECTION1", {}, True, 1000)
 
-    def test_state_is_atomic_private_and_loadable_as_latest(self):
+    def test_state_is_private_and_loadable_as_latest(self):
         with tempfile.TemporaryDirectory() as tmp:
-            state_dir = Path(tmp) / ".jobs"
+            database = Path(tmp) / "workflow.sqlite3"
             path = mineru_workflow.save_state(
-                {"batch_id": "BATCH1", "files": []}, state_dir
+                {"batch_id": "BATCH1", "files": []}, database
             )
-            self.assertEqual(path, state_dir / "BATCH1.json")
+            self.assertEqual(path, database)
             if os.name != "nt":
                 self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
             self.assertEqual(
-                mineru_workflow.load_state("latest", state_dir)["batch_id"],
+                mineru_workflow.load_state("latest", database)["batch_id"],
                 "BATCH1",
             )
-            self.assertFalse(list(state_dir.glob("*.tmp")))
 
     def test_select_batch_honors_file_and_page_limits(self):
         ready = [
@@ -133,14 +147,114 @@ class MinerUWorkflowTests(unittest.TestCase):
             pdf.write_bytes(b"%PDF-current")
             plan = self.plan_single_pdf(pdf, "PDF1")
             self.assertEqual(plan["existing"], [])
-            self.assertEqual(plan["ready"][0]["plan_status"], "untracked")
-            self.assertTrue(plan["ready"][0]["replace_existing"])
+            self.assertEqual(plan["ready"], [])
+            self.assertEqual(
+                plan["untracked_existing"][0]["plan_status"], "untracked_existing"
+            )
+            self.assertEqual(plan["blocked"][0]["plan_status"], "untracked_existing")
+            self.assertTrue(plan["blocked"][0]["replace_existing"])
 
-    def test_todo_status_transitions_preserve_old_key_until_parse_finishes(self):
+    def test_sync_does_not_register_untracked_existing_result(self):
         with tempfile.TemporaryDirectory() as tmp:
-            todo_path = Path(tmp) / "todo.csv"
-            self.write_todo(
-                todo_path,
+            database = Path(tmp) / "workflow.sqlite3"
+            plan = {
+                "existing": [],
+                "ready": [],
+                "blocked": [
+                    {
+                        "data_id": "ITEM1",
+                        "plan_status": "untracked_existing",
+                    }
+                ],
+                "missing": [],
+            }
+            self.assertEqual(
+                mineru_workflow.sync_mineru_records_from_plan(plan, database), []
+            )
+            self.assertEqual(mineru_workflow.mineru_records_by_key(database), {})
+
+    def test_adopt_existing_plan_then_confirm_only_writes_sqlite(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output_root = root / "Zotero_MinerU"
+            output_dir = output_root / "ITEM1"
+            output_dir.mkdir(parents=True)
+            (output_dir / "full.md").write_text("# Paper", encoding="utf-8")
+            for name in (
+                "content_list.json",
+                "content_list_v2.json",
+                "model.json",
+                "layout.json",
+            ):
+                (output_dir / name).write_text("[]", encoding="utf-8")
+            (output_dir / "origin.pdf").write_bytes(b"%PDF-1.4\n")
+            with zipfile.ZipFile(output_dir / "result.zip", "w") as archive:
+                archive.writestr("full.md", "# Paper")
+            source = root / "source.pdf"
+            source.write_bytes(b"%PDF-source")
+            database = root / "workflow.sqlite3"
+            item = {"data": {"key": "ITEM1", "title": "Paper"}}
+            attachment = {
+                "key": "PDF1",
+                "title": "PDF",
+                "filename": "paper.pdf",
+                "path": source,
+            }
+            with (
+                mock.patch.object(mineru_workflow, "OUTPUT_ROOT", output_root),
+                mock.patch.object(
+                    mineru_workflow.zotero_local, "get_item", return_value=item
+                ),
+                mock.patch.object(
+                    mineru_workflow.zotero_local,
+                    "pdf_attachments_for_item",
+                    return_value=[attachment],
+                ),
+                mock.patch.object(
+                    mineru_workflow.zotero_local,
+                    "pdf_text_language_stats",
+                    return_value=(0.01, 500),
+                ),
+                mock.patch.object(mineru_workflow, "pdf_page_count", return_value=10),
+            ):
+                plan = mineru_workflow.adopt_existing_plan("ITEM1", "PDF1", database)
+                self.assertFalse(database.exists())
+                adopted = mineru_workflow.adopt_existing(plan, database)
+            self.assertEqual(adopted["status"], "adopted")
+            self.assertEqual(
+                mineru_workflow.mineru_records_by_key(database)["ITEM1"],
+                {
+                    "item_key": "ITEM1",
+                    "parsed_attachment_key": "PDF1",
+                    "has_pdf": "true",
+                    "mineru_parsed": "true",
+                    "qmd_indexed": "false",
+                },
+            )
+
+    def test_adopt_existing_rejects_existing_sqlite_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            database = Path(tmp) / "workflow.sqlite3"
+            self.write_mineru_records(
+                database,
+                [
+                    {
+                        "item_key": "ITEM1",
+                        "parsed_attachment_key": "PDF1",
+                        "has_pdf": "true",
+                        "mineru_parsed": "true",
+                        "qmd_indexed": "false",
+                    }
+                ],
+            )
+            with self.assertRaisesRegex(RuntimeError, "already exists"):
+                mineru_workflow.adopt_existing_plan("ITEM1", "PDF2", database)
+
+    def test_mineru_status_transitions_preserve_old_key_until_parse_finishes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            database = Path(tmp) / "workflow.sqlite3"
+            self.write_mineru_records(
+                database,
                 [
                     {
                         "item_key": "ITEM1",
@@ -151,27 +265,27 @@ class MinerUWorkflowTests(unittest.TestCase):
                     }
                 ],
             )
-            mineru_workflow.mark_todo_stale("ITEM1", todo_path)
-            stale = mineru_workflow.todo_rows_by_key(todo_path)["ITEM1"]
+            mineru_workflow.mark_mineru_stale("ITEM1", database)
+            stale = mineru_workflow.mineru_records_by_key(database)["ITEM1"]
             self.assertEqual(stale["parsed_attachment_key"], "OLDPDF1")
             self.assertEqual(stale["mineru_parsed"], "false")
             self.assertEqual(stale["qmd_indexed"], "false")
 
-            mineru_workflow.mark_todo_parsed("ITEM1", "NEWPDF1", todo_path)
-            parsed = mineru_workflow.todo_rows_by_key(todo_path)["ITEM1"]
+            mineru_workflow.mark_mineru_parsed("ITEM1", "NEWPDF1", database)
+            parsed = mineru_workflow.mineru_records_by_key(database)["ITEM1"]
             self.assertEqual(parsed["parsed_attachment_key"], "NEWPDF1")
             self.assertEqual(parsed["mineru_parsed"], "true")
             self.assertEqual(parsed["qmd_indexed"], "false")
 
-            mineru_workflow.mark_todo_qmd_indexed(todo_path=todo_path)
-            indexed = mineru_workflow.todo_rows_by_key(todo_path)["ITEM1"]
+            mineru_workflow.mark_mineru_qmd_indexed(database=database)
+            indexed = mineru_workflow.mineru_records_by_key(database)["ITEM1"]
             self.assertEqual(indexed["qmd_indexed"], "true")
 
-    def test_concurrent_todo_updates_preserve_both_rows(self):
+    def test_concurrent_mineru_updates_preserve_both_rows(self):
         with tempfile.TemporaryDirectory() as tmp:
-            todo_path = Path(tmp) / "todo.csv"
-            self.write_todo(
-                todo_path,
+            database = Path(tmp) / "workflow.sqlite3"
+            self.write_mineru_records(
+                database,
                 [
                     {
                         "item_key": key,
@@ -183,69 +297,44 @@ class MinerUWorkflowTests(unittest.TestCase):
                     for key in ("ITEM1", "ITEM2")
                 ],
             )
-            original_save = mineru_workflow._save_todo_rows_unlocked
-            first_save = threading.Event()
-            release_first = threading.Event()
-            save_calls = 0
-            save_calls_lock = threading.Lock()
-
-            def delayed_save(rows, path=None):
-                nonlocal save_calls
-                with save_calls_lock:
-                    save_calls += 1
-                    is_first = save_calls == 1
-                if is_first:
-                    first_save.set()
-                    self.assertTrue(release_first.wait(timeout=5))
-                return original_save(rows, path)
 
             def update(item_key):
-                mineru_workflow.update_todo_row(
-                    item_key, {"mineru_parsed": "true"}, todo_path
+                mineru_workflow.update_mineru_record(
+                    item_key, {"mineru_parsed": "true"}, database
                 )
 
-            with mock.patch.object(
-                mineru_workflow,
-                "_save_todo_rows_unlocked",
-                side_effect=delayed_save,
-            ):
-                first = threading.Thread(target=update, args=("ITEM1",))
-                second = threading.Thread(target=update, args=("ITEM2",))
-                first.start()
-                self.assertTrue(first_save.wait(timeout=5))
-                second.start()
-                time.sleep(0.05)
-                release_first.set()
-                first.join(timeout=5)
-                second.join(timeout=5)
+            first = threading.Thread(target=update, args=("ITEM1",))
+            second = threading.Thread(target=update, args=("ITEM2",))
+            first.start()
+            second.start()
+            first.join(timeout=5)
+            second.join(timeout=5)
             self.assertFalse(first.is_alive())
             self.assertFalse(second.is_alive())
-            rows = mineru_workflow.todo_rows_by_key(todo_path)
+            rows = mineru_workflow.mineru_records_by_key(database)
             self.assertEqual(rows["ITEM1"]["mineru_parsed"], "true")
             self.assertEqual(rows["ITEM2"]["mineru_parsed"], "true")
 
-    def test_sync_todo_adds_new_parent_items_from_plan(self):
+    def test_sync_mineru_records_adds_new_parent_items_from_plan(self):
         with tempfile.TemporaryDirectory() as tmp:
-            todo_path = Path(tmp) / "todo.csv"
-            self.write_todo(todo_path, [])
+            database = Path(tmp) / "workflow.sqlite3"
             plan = {
                 "existing": [],
                 "ready": [{"data_id": "NEWPDF"}],
                 "blocked": [],
                 "missing": [{"data_id": "NOPDF"}],
             }
-            added = mineru_workflow.sync_todo_from_plan(plan, todo_path)
+            added = mineru_workflow.sync_mineru_records_from_plan(plan, database)
             self.assertEqual(added, ["NEWPDF", "NOPDF"])
-            rows = mineru_workflow.todo_rows_by_key(todo_path)
+            rows = mineru_workflow.mineru_records_by_key(database)
             self.assertEqual(rows["NEWPDF"]["has_pdf"], "true")
             self.assertEqual(rows["NOPDF"]["has_pdf"], "false")
             self.assertEqual(rows["NEWPDF"]["parsed_attachment_key"], "")
 
     def test_submit_batch_saves_receipt_before_uploading(self):
         with tempfile.TemporaryDirectory() as tmp:
-            state_dir = Path(tmp) / ".jobs"
-            todo_path = Path(tmp) / "todo.csv"
-            self.write_todo(todo_path, [])
+            staging_dir = Path(tmp) / ".staging"
+            database = Path(tmp) / "workflow.sqlite3"
             plan = {
                 "collection_key": "COLLECTION1",
                 "item_count": 1,
@@ -267,8 +356,7 @@ class MinerUWorkflowTests(unittest.TestCase):
             observed = {}
 
             def inspect_saved_state(state):
-                path = state_dir / "BATCH1.json"
-                observed.update(json.loads(path.read_text(encoding="utf-8")))
+                observed.update(mineru_workflow.load_state("BATCH1", database))
                 return []
 
             arguments = SimpleNamespace(
@@ -278,8 +366,8 @@ class MinerUWorkflowTests(unittest.TestCase):
                 recursive=False,
             )
             with (
-                mock.patch.object(mineru_workflow, "STATE_DIR", state_dir),
-                mock.patch.object(mineru_workflow, "TODO_PATH", todo_path),
+                mock.patch.object(mineru_workflow, "STAGING_DIR", staging_dir),
+                mock.patch.object(mineru_workflow, "WORKFLOW_DATABASE", database),
                 mock.patch.object(
                     mineru_workflow, "collection_plan", return_value=plan
                 ),
@@ -305,7 +393,8 @@ class MinerUWorkflowTests(unittest.TestCase):
     def test_collect_downloads_every_done_result(self):
         with tempfile.TemporaryDirectory() as tmp:
             output_root = Path(tmp) / "Zotero_MinerU"
-            state_dir = output_root / ".jobs"
+            staging_dir = output_root / ".staging"
+            database = Path(tmp) / "workflow.sqlite3"
             state = {
                 "batch_id": "BATCH1",
                 "files": [
@@ -325,8 +414,7 @@ class MinerUWorkflowTests(unittest.TestCase):
                     },
                 ],
             }
-            with mock.patch.object(mineru_workflow, "STATE_DIR", state_dir):
-                mineru_workflow.save_state(state)
+            mineru_workflow.save_state(state, database)
             batch = {
                 "extract_result": [
                     {
@@ -346,7 +434,8 @@ class MinerUWorkflowTests(unittest.TestCase):
             arguments = SimpleNamespace(batch_id="BATCH1")
             with (
                 mock.patch.object(mineru_workflow, "OUTPUT_ROOT", output_root),
-                mock.patch.object(mineru_workflow, "STATE_DIR", state_dir),
+                mock.patch.object(mineru_workflow, "STAGING_DIR", staging_dir),
+                mock.patch.object(mineru_workflow, "WORKFLOW_DATABASE", database),
                 mock.patch.object(mineru_workflow, "upload_pending", return_value=[]),
                 mock.patch.object(
                     mineru_workflow.mineru_client,
@@ -365,20 +454,20 @@ class MinerUWorkflowTests(unittest.TestCase):
                 result = mineru_workflow.cmd_collect(arguments)
             self.assertEqual(result, 0)
             self.assertEqual(download.call_count, 2)
-            completed = mineru_workflow.load_state("BATCH1", state_dir)
+            completed = mineru_workflow.load_state("BATCH1", database)
             self.assertEqual(completed["status"], "complete")
             self.assertTrue(all(record["downloaded"] for record in completed["files"]))
 
     def test_collect_replaces_stale_result_without_backup(self):
         with tempfile.TemporaryDirectory() as tmp:
             output_root = Path(tmp) / "Zotero_MinerU"
-            state_dir = output_root / ".jobs"
-            todo_path = output_root / "todo.csv"
+            staging_dir = output_root / ".staging"
+            database = Path(tmp) / "workflow.sqlite3"
             old_output = output_root / "ITEM1"
             old_output.mkdir(parents=True)
             (old_output / "version.txt").write_text("old", encoding="utf-8")
-            self.write_todo(
-                todo_path,
+            self.write_mineru_records(
+                database,
                 [
                     {
                         "item_key": "ITEM1",
@@ -403,8 +492,7 @@ class MinerUWorkflowTests(unittest.TestCase):
                     }
                 ],
             }
-            with mock.patch.object(mineru_workflow, "STATE_DIR", state_dir):
-                mineru_workflow.save_state(state)
+            mineru_workflow.save_state(state, database)
 
             def download_result(_url, destination):
                 destination.mkdir(parents=True)
@@ -423,8 +511,8 @@ class MinerUWorkflowTests(unittest.TestCase):
             }
             with (
                 mock.patch.object(mineru_workflow, "OUTPUT_ROOT", output_root),
-                mock.patch.object(mineru_workflow, "STATE_DIR", state_dir),
-                mock.patch.object(mineru_workflow, "TODO_PATH", todo_path),
+                mock.patch.object(mineru_workflow, "STAGING_DIR", staging_dir),
+                mock.patch.object(mineru_workflow, "WORKFLOW_DATABASE", database),
                 mock.patch.object(mineru_workflow, "upload_pending", return_value=[]),
                 mock.patch.object(
                     mineru_workflow.mineru_client, "get_batch", return_value=batch
@@ -447,8 +535,8 @@ class MinerUWorkflowTests(unittest.TestCase):
                 (output_root / "ITEM1" / "version.txt").read_text(encoding="utf-8"),
                 "new",
             )
-            self.assertEqual(list((state_dir / "BATCH1").iterdir()), [])
-            row = mineru_workflow.todo_rows_by_key(todo_path)["ITEM1"]
+            self.assertEqual(list((staging_dir / "BATCH1").iterdir()), [])
+            row = mineru_workflow.mineru_records_by_key(database)["ITEM1"]
             self.assertEqual(row["parsed_attachment_key"], "NEWPDF1")
             self.assertEqual(row["mineru_parsed"], "true")
             self.assertEqual(row["qmd_indexed"], "false")
@@ -456,7 +544,8 @@ class MinerUWorkflowTests(unittest.TestCase):
     def test_collect_keeps_old_result_when_replacement_verification_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             output_root = Path(tmp) / "Zotero_MinerU"
-            state_dir = output_root / ".jobs"
+            staging_dir = output_root / ".staging"
+            database = Path(tmp) / "workflow.sqlite3"
             old_output = output_root / "ITEM1"
             old_output.mkdir(parents=True)
             (old_output / "version.txt").write_text("old", encoding="utf-8")
@@ -473,8 +562,7 @@ class MinerUWorkflowTests(unittest.TestCase):
                     }
                 ],
             }
-            with mock.patch.object(mineru_workflow, "STATE_DIR", state_dir):
-                mineru_workflow.save_state(state)
+            mineru_workflow.save_state(state, database)
 
             def download_result(_url, destination):
                 destination.mkdir(parents=True)
@@ -492,7 +580,8 @@ class MinerUWorkflowTests(unittest.TestCase):
             }
             with (
                 mock.patch.object(mineru_workflow, "OUTPUT_ROOT", output_root),
-                mock.patch.object(mineru_workflow, "STATE_DIR", state_dir),
+                mock.patch.object(mineru_workflow, "STAGING_DIR", staging_dir),
+                mock.patch.object(mineru_workflow, "WORKFLOW_DATABASE", database),
                 mock.patch.object(mineru_workflow, "upload_pending", return_value=[]),
                 mock.patch.object(
                     mineru_workflow.mineru_client, "get_batch", return_value=batch

@@ -7,6 +7,7 @@ import argparse
 import errno
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -44,21 +45,14 @@ def qmd_collection() -> str:
     )
 
 
-def pipeline_states(state_dir: Path | None = None) -> list[dict[str, Any]]:
-    state_dir = mineru_workflow.STATE_DIR if state_dir is None else state_dir
-    states = []
-    for path in sorted(state_dir.glob("*.json"), key=lambda item: item.stat().st_mtime):
-        state = json.loads(path.read_text(encoding="utf-8"))
-        if state.get("batch_id") != path.stem:
-            raise RuntimeError(f"Batch state does not match filename: {path}")
-        states.append(state)
-    return states
+def pipeline_states(database: Path | None = None) -> list[dict[str, Any]]:
+    return mineru_workflow.list_states(database)
 
 
-def find_active_batch(collection_key: str, state_dir: Path | None = None) -> str | None:
+def find_active_batch(collection_key: str, database: Path | None = None) -> str | None:
     active = [
         state
-        for state in pipeline_states(state_dir)
+        for state in pipeline_states(database)
         if state.get("collection_key") == collection_key
         and state.get("status") != "complete"
     ]
@@ -73,10 +67,10 @@ def find_active_batch(collection_key: str, state_dir: Path | None = None) -> str
 def unresolved_failed_keys(
     collection_key: str,
     ready_keys: set[str],
-    state_dir: Path | None = None,
+    database: Path | None = None,
 ) -> list[str]:
     failed = set()
-    for state in pipeline_states(state_dir):
+    for state in pipeline_states(database):
         if state.get("collection_key") != collection_key:
             continue
         failed.update(set(state_failed_keys(state)) & ready_keys)
@@ -186,13 +180,18 @@ def verify_qmd_items(item_keys: list[str]) -> tuple[list[str], list[str]]:
         raise RuntimeError("QMD multi-get returned invalid JSON") from exc
     if not isinstance(documents, list):
         raise TypeError("QMD multi-get returned invalid data")
-    found = {
-        str(document.get("file"))
-        for document in documents
-        if isinstance(document, dict)
-    }
-    verified = [key for key in item_keys if references[key] in found]
-    missing = [key for key in item_keys if references[key] not in found]
+    collection_prefix = f"qmd://{collection}/"
+    found: set[str] = set()
+    for document in documents:
+        if not isinstance(document, dict):
+            continue
+        file_name = str(document.get("file") or "").strip()
+        if file_name.startswith(collection_prefix):
+            file_name = file_name.removeprefix(collection_prefix)
+        if re.fullmatch(r"[^/]+/full\.md", file_name):
+            found.add(file_name)
+    verified = [key for key in item_keys if f"{key}/full.md" in found]
+    missing = [key for key in item_keys if f"{key}/full.md" not in found]
     return verified, missing
 
 
@@ -211,7 +210,7 @@ def start_qmd_embed(
         options["start_new_session"] = True
     process = subprocess.Popen(command, **options)
     process.qmd_item_keys = (
-        mineru_workflow.todo_keys_needing_qmd()
+        mineru_workflow.mineru_keys_needing_qmd()
         if item_keys is None
         else list(item_keys)
     )
@@ -226,7 +225,7 @@ def wait_qmd_embed(process: subprocess.Popen[bytes] | None) -> None:
         raise RuntimeError(f"QMD embedding failed with exit code {return_code}")
     item_keys = list(getattr(process, "qmd_item_keys", []))
     verified, missing = verify_qmd_items(item_keys)
-    mineru_workflow.mark_todo_qmd_indexed(verified)
+    mineru_workflow.mark_mineru_qmd_indexed(verified)
     if missing:
         raise RuntimeError(f"QMD could not read indexed MinerU documents: {missing}")
     print("QMD_EMBED_DONE", flush=True)
@@ -262,7 +261,7 @@ def start_qmd_cycle(
     previous: subprocess.Popen[bytes] | None, reason: str
 ) -> subprocess.Popen[bytes] | None:
     wait_qmd_embed(previous)
-    item_keys = mineru_workflow.todo_keys_needing_qmd()
+    item_keys = mineru_workflow.mineru_keys_needing_qmd()
     if not item_keys:
         print(f"QMD_CYCLE_SKIP reason={reason} pending=0", flush=True)
         return None
@@ -384,7 +383,7 @@ def run_pipeline(arguments: argparse.Namespace) -> int:
                 plan = mineru_workflow.collection_plan(
                     arguments.collection_key, arguments.recursive
                 )
-                mineru_workflow.sync_todo_from_plan(plan)
+                mineru_workflow.sync_mineru_records_from_plan(plan)
                 print_plan_summary(plan, remaining_page_budget)
                 if not plan["ready"]:
                     wait_qmd_embed(qmd_process)

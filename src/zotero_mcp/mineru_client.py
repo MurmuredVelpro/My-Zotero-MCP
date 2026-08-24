@@ -10,17 +10,21 @@ import stat
 import tempfile
 import uuid
 import zipfile
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 import requests
+from mineru._api import ApiClient
 
 from . import zotero_runtime
 
 API_BASE = "https://mineru.net/api/v4"
-LEGACY_TOKEN_PATH = Path(__file__).with_name("token")
+SDK_SOURCE = "zotero-mcp-local"
+DEFAULT_TOKEN_FILE = "mineru_api_token.secret"
 MODEL_VERSIONS = {"pipeline", "vlm"}
 MAX_BATCH_FILES = 50
+TRANSFER_TIMEOUT = (10, 300)
 REQUIRED_RESULT_ARTIFACTS = (
     "result.zip",
     "full.md",
@@ -46,18 +50,21 @@ def output_root() -> Path:
 DEFAULT_OUTPUT_ROOT = output_root()
 
 
+def default_token_path() -> Path:
+    if os.name == "nt":
+        root = Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming")
+    else:
+        root = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    return root / "mineru" / DEFAULT_TOKEN_FILE
+
+
 def token_path() -> Path:
     configured = zotero_runtime.configured_path(
         "MINERU_API_TOKEN_FILE", "mineru", "token_file"
     )
     if configured:
         return configured
-    default = zotero_runtime.default_secret_path("mineru_api_token")
-    return (
-        default
-        if default.is_file() or not LEGACY_TOKEN_PATH.is_file()
-        else LEGACY_TOKEN_PATH
-    )
+    return default_token_path()
 
 
 def load_token(path: Path | None = None) -> str:
@@ -77,26 +84,18 @@ def load_token(path: Path | None = None) -> str:
     return token
 
 
-def auth_headers(token: str) -> dict[str, str]:
-    return {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-        "Accept": "*/*",
-    }
-
-
-def response_data(response: requests.Response, action: str) -> dict[str, Any]:
+@contextmanager
+def api_client(token: str | None = None):
+    # The public SDK omits split-upload primitives. Pin its version and isolate
+    # the official low-level client here to preserve recoverable batch uploads.
+    client = ApiClient(token or load_token(), API_BASE, source=SDK_SOURCE)
     try:
-        payload = response.json()
-    except ValueError as exc:
-        raise MinerUError(
-            f"{action} returned invalid JSON (HTTP {response.status_code})"
-        ) from exc
-    if response.status_code >= 400 or payload.get("code") != 0:
-        raise MinerUError(
-            f"{action} failed: HTTP {response.status_code}, "
-            f"code={payload.get('code')}, msg={payload.get('msg')}"
-        )
+        yield client
+    finally:
+        client.close()
+
+
+def response_data(payload: dict[str, Any], action: str) -> dict[str, Any]:
     data = payload.get("data")
     if not isinstance(data, dict):
         raise MinerUError(f"{action} returned no data object")
@@ -137,14 +136,13 @@ def request_upload_batch(
         "enable_formula": enable_formula,
         "enable_table": enable_table,
     }
-    token = token or load_token()
-    response = requests.post(
-        f"{API_BASE}/file-urls/batch",
-        headers=auth_headers(token),
-        json=body,
-        timeout=(30, 90),
-    )
-    data = response_data(response, "Request MinerU upload URL")
+    action = "Request MinerU upload URL"
+    try:
+        with api_client(token) as client:
+            payload = client.post("/file-urls/batch", json=body)
+    except Exception as exc:
+        raise MinerUError(f"{action} failed: {exc}") from exc
+    data = response_data(payload, action)
     batch_id = data.get("batch_id")
     file_urls = data.get("file_urls")
     if (
@@ -167,13 +165,17 @@ def upload_file(file_path: Path, upload_url: str) -> int:
     if not upload_url.startswith("https://"):
         raise MinerUError("MinerU upload URL is not HTTPS")
 
-    with file_path.open("rb") as source:
-        upload = requests.put(upload_url, data=source, timeout=(30, 1800))
-    if upload.status_code not in {200, 201, 204}:
-        raise MinerUError(
-            f"Upload PDF to MinerU failed: HTTP {upload.status_code}, file={file_path}"
-        )
-    return upload.status_code
+    try:
+        with file_path.open("rb") as handle:
+            response = requests.put(
+                upload_url,
+                data=handle,
+                timeout=TRANSFER_TIMEOUT,
+            )
+            response.raise_for_status()
+    except Exception as exc:
+        raise MinerUError(f"Upload PDF to MinerU failed: {file_path}: {exc}") from exc
+    return response.status_code
 
 
 def submit_file(
@@ -218,13 +220,13 @@ def submit_file(
 def get_batch(batch_id: str, *, token: str | None = None) -> dict[str, Any]:
     if not batch_id.strip():
         raise MinerUError("batch_id is required")
-    token = token or load_token()
-    response = requests.get(
-        f"{API_BASE}/extract-results/batch/{batch_id}",
-        headers=auth_headers(token),
-        timeout=(30, 90),
-    )
-    return response_data(response, "Query MinerU batch")
+    action = "Query MinerU batch"
+    try:
+        with api_client(token) as client:
+            payload = client.get(f"/extract-results/batch/{batch_id}")
+    except Exception as exc:
+        raise MinerUError(f"{action} failed: {exc}") from exc
+    return response_data(payload, action)
 
 
 def extract_results(batch: dict[str, Any]) -> list[dict[str, Any]]:
@@ -422,21 +424,36 @@ def download_and_extract(full_zip_url: str, output_dir: Path) -> dict[str, Any]:
     try:
         zip_path = staged_dir / "result.zip"
         partial = staged_dir / "result.zip.part"
-        response = requests.get(full_zip_url, stream=True, timeout=(30, 600))
         try:
-            if response.status_code >= 400:
-                raise MinerUError(
-                    f"Download MinerU result failed: HTTP {response.status_code}"
-                )
-            with partial.open("wb") as destination:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    if chunk:
-                        destination.write(chunk)
-            partial.replace(zip_path)
-        finally:
-            close = getattr(response, "close", None)
-            if close:
-                close()
+            with requests.get(
+                full_zip_url,
+                stream=True,
+                timeout=TRANSFER_TIMEOUT,
+            ) as response:
+                response.raise_for_status()
+                expected = response.headers.get("Content-Length")
+                expected_bytes = int(expected) if expected else None
+                downloaded = 0
+                with partial.open("wb") as handle:
+                    for chunk in response.iter_content(chunk_size=1024 * 1024):
+                        if not chunk:
+                            continue
+                        handle.write(chunk)
+                        downloaded += len(chunk)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                if downloaded == 0:
+                    raise MinerUError("MinerU result download was empty")
+                if expected_bytes is not None and downloaded != expected_bytes:
+                    raise MinerUError(
+                        "MinerU result download was incomplete: "
+                        f"expected={expected_bytes} received={downloaded}"
+                    )
+        except Exception as exc:
+            if isinstance(exc, MinerUError):
+                raise
+            raise MinerUError(f"Download MinerU result failed: {exc}") from exc
+        partial.replace(zip_path)
         safe_extract(zip_path, staged_dir)
         canonicalize_artifacts(staged_dir)
         missing = missing_result_artifacts(staged_dir)
