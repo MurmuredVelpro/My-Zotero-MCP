@@ -154,7 +154,11 @@ For document parsing outside Zotero, install the official
 as a fourth independent MCP server. Its `MINERU_API_TOKEN` should be supplied
 at process launch from the private MinerU secret file, not written into Codex
 configuration. Zotero batch parsing uses the official `mineru-open-sdk` and
-keeps its recoverable Zotero/QMD workflow.
+keeps its recoverable Zotero/QMD workflow. To avoid creating the independent
+server's default output directory during startup, launch it with
+`scripts/run_mineru_open_mcp_lazy.py` using the Python interpreter where the
+official MCP is installed. The parser still creates an explicitly selected
+`output_dir` only when it saves results.
 
 For literature discovery, use SciVerse together with the optional [`paper-lookup`](https://github.com/K-Dense-AI/scientific-agent-skills/tree/main/skills/paper-lookup) skill. `setup plan --profile full` detects whether the skill is installed. When it is missing, ask Codex to use its built-in `skill-installer` for repository `K-Dense-AI/scientific-agent-skills`, path `skills/paper-lookup`; installation requires user approval.
 

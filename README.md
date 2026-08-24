@@ -207,7 +207,7 @@ Zotero Web API key 默认保存在 Zotero MCP 配置目录下的 `zotero_web_api
 
 ## MinerU 批处理
 
-Zotero 批处理通过官方 `mineru-open-sdk` 访问 MinerU，同时保留可恢复上传、Zotero item-key 目录、产物验证和 QMD 流水线。通用文件解析应另行安装官方 `mineru-open-mcp`，作为独立 MCP 使用；它与下列 Zotero 专用命令互不替代。
+Zotero 批处理通过官方 `mineru-open-sdk` 访问 MinerU，同时保留可恢复上传、Zotero item-key 目录、产物验证和 QMD 流水线。通用文件解析应另行安装官方 `mineru-open-mcp`，作为独立 MCP 使用；它与下列 Zotero 专用命令互不替代。若不希望 MCP 启动时创建空的默认输出目录，可用 `scripts/run_mineru_open_mcp_lazy.py` 启动官方 MCP；它不修改官方安装包，显式传入 `output_dir` 的行为保持不变。
 
 单批预检与提交：
 
