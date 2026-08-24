@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import os
+import sys
 import tempfile
 import threading
 import time
@@ -142,26 +143,46 @@ class FakeResponse:
 
 
 class FakePDF2ZHSession:
-    def __init__(self) -> None:
+    def __init__(self, *, post_data=None, history=None) -> None:
         self.calls = []
+        self.post_data = post_data or {"status": "accepted", "taskId": "task-1"}
+        self.history = list(history or [])
+        self.posted_input = ""
 
     def get(self, url, **kwargs):
         self.calls.append(("GET", url, kwargs))
         if url.endswith("/health"):
             return FakeResponse(200, {"status": "ok"})
+        if url.endswith("/api/tasks"):
+            return FakeResponse(200, {"status": "success", "tasks": []})
+        if url.endswith("/api/history"):
+            history = list(self.history)
+            if self.posted_input and not history:
+                history = [
+                    {
+                        "taskId": "task-1",
+                        "fileName": self.posted_input,
+                        "status": "success",
+                        "finished": True,
+                        "active": False,
+                        "fileList": [
+                            self.posted_input.replace(
+                                ".pdf", ".no_watermark.zh-CN.mono.pdf"
+                            )
+                        ],
+                    }
+                ]
+            return FakeResponse(200, {"status": "success", "history": history})
         if "/translatedFile/" in url:
+            if not self.posted_input and not self.history:
+                return FakeResponse(404)
             return FakeResponse(200, content=b"%PDF-1.4 translated")
         raise AssertionError(url)
 
     def post(self, url, **kwargs):
         self.calls.append(("POST", url, kwargs))
-        return FakeResponse(
-            200,
-            {
-                "status": "success",
-                "fileList": ["paper.no_watermark.zh-CN.mono.pdf"],
-            },
-        )
+        self.posted_input = kwargs["json"]["fileName"]
+        return FakeResponse(200, self.post_data)
 
 
 class PDF2ZHPrefsTests(unittest.TestCase):
@@ -254,6 +275,7 @@ class PDF2ZHPrefsTests(unittest.TestCase):
         self.assertTrue(payload["mono"])
         self.assertFalse(payload["dual"])
         self.assertTrue(payload["noDual"])
+        self.assertTrue(payload["asyncJob"])
 
     def test_explicit_prefs_path_does_not_fall_back_to_another_profile(self):
         explicit = Path("chosen-prefs.js")
@@ -292,6 +314,17 @@ class PDF2ZHPrefsTests(unittest.TestCase):
 
 
 class PDF2ZHClientTests(unittest.TestCase):
+    def test_input_filename_preserves_zotero_storage_filename(self):
+        source_pdf = Path(
+            "/mnt/d/Zotero/storage/5YV6TSRS/"
+            "2025_Science China. LIFE Sciences_Biomedical data and AI_Xu 等.pdf"
+        )
+
+        self.assertEqual(
+            zotero_translate.PDF2ZHClient.input_filename(source_pdf),
+            "2025_Science China. LIFE Sciences_Biomedical data and AI_Xu 等.pdf",
+        )
+
     def test_downloads_translated_pdf_over_http(self):
         with tempfile.TemporaryDirectory() as tmp:
             source = Path(tmp) / "Dudnyk et al - 2024.pdf"
@@ -305,6 +338,81 @@ class PDF2ZHClientTests(unittest.TestCase):
         self.assertEqual(output.parent.name, "ABCD1234_EFGH5678")
         self.assertTrue(any("/translatedFile/" in call[1] for call in session.calls))
         self.assertFalse(any("server/translated" in call[1] for call in session.calls))
+        post = next(call for call in session.calls if call[0] == "POST")
+        self.assertEqual(post[2]["headers"], zotero_translate.PDF2ZH_ASYNC_HEADERS)
+        self.assertTrue(post[2]["json"]["asyncJob"])
+
+    def test_rejects_unexpected_submission_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "paper.pdf"
+            source.write_bytes(b"%PDF-1.4 source")
+            client = zotero_translate.PDF2ZHClient(
+                session=FakePDF2ZHSession(post_data={"status": "invalid"}),
+                output_dir=Path(tmp) / "output",
+            )
+            with self.assertRaisesRegex(
+                zotero_translate.TranslationError,
+                "unexpected status invalid",
+            ):
+                client.translate(settings(), "ABCD1234", "EFGH5678", source, 7, 13)
+
+    def test_recovers_completed_history_without_resubmitting(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "paper.pdf"
+            source.write_bytes(b"%PDF-1.4 source")
+            input_name = "paper.pdf"
+            session = FakePDF2ZHSession(
+                history=[
+                    {
+                        "taskId": "task-old",
+                        "fileName": input_name,
+                        "status": "success",
+                        "finished": True,
+                        "active": False,
+                        "result": {
+                            "filePaths": [
+                                "/translated/"
+                                + input_name.replace(
+                                    ".pdf", ".no_watermark.zh-CN.mono.pdf"
+                                )
+                            ],
+                            "outputDir": "/translated",
+                        },
+                    }
+                ]
+            )
+            client = zotero_translate.PDF2ZHClient(
+                session=session, output_dir=Path(tmp) / "output"
+            )
+            output = client.translate(settings(), "ABCD1234", "EFGH5678", source, 7, 13)
+        self.assertEqual(output.name, "paper的全文翻译.pdf")
+        self.assertFalse(any(call[0] == "POST" for call in session.calls))
+
+    def test_blocks_multiple_same_filename_tasks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "paper.pdf"
+            source.write_bytes(b"%PDF-1.4 source")
+            input_name = "paper.pdf"
+            session = FakePDF2ZHSession(
+                history=[
+                    {
+                        "taskId": task_id,
+                        "fileName": input_name,
+                        "status": "failed",
+                        "finished": True,
+                        "active": False,
+                    }
+                    for task_id in ("task-1", "task-2")
+                ]
+            )
+            client = zotero_translate.PDF2ZHClient(
+                session=session, output_dir=Path(tmp) / "output"
+            )
+            with self.assertRaisesRegex(
+                zotero_translate.TranslationError,
+                "multiple PDF2zh tasks found",
+            ):
+                client.translate(settings(), "ABCD1234", "EFGH5678", source, 7, 13)
 
     def test_custom_naming_controls_downloaded_filename(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -797,7 +905,15 @@ class FakeServer:
         self.health_calls += 1
         return "http://localhost:8890"
 
-    def translate(self, value, parent_key, source_key, source_pdf, qps, pool_size):
+    def translate(
+        self,
+        value,
+        parent_key,
+        source_key,
+        source_pdf,
+        qps,
+        pool_size,
+    ):
         self.translate_calls += 1
         self.output.write_bytes(b"%PDF-1.4 translated")
         return self.output
@@ -843,7 +959,15 @@ class ConcurrentFakeServer:
         self.state = state
         self.base_url = ""
 
-    def translate(self, value, parent_key, source_key, source_pdf, qps, pool_size):
+    def translate(
+        self,
+        value,
+        parent_key,
+        source_key,
+        source_pdf,
+        qps,
+        pool_size,
+    ):
         started = time.monotonic()
         with self.state.lock:
             self.state.active += 1
@@ -1910,6 +2034,21 @@ class SchedulingTests(unittest.TestCase):
                 max_items=2,
             )
         command = run.call_args.args[0]
+        resolved_python = str(Path(sys.executable).resolve())
+        module_start = [
+            resolved_python,
+            "-m",
+            "zotero_mcp.zotero_translate",
+            "run",
+        ]
+        self.assertIn(
+            module_start,
+            [
+                command[index : index + len(module_start)]
+                for index in range(len(command))
+            ],
+        )
+        self.assertNotIn("src/zotero_mcp/zotero_translate.py", command)
         self.assertIn("--user", command)
         self.assertIn("--collect", command)
         self.assertTrue(any(value.startswith("--on-calendar=") for value in command))
@@ -1951,6 +2090,13 @@ class SchedulingTests(unittest.TestCase):
                 max_items=2,
             )
         command = run.call_args.args[0]
+        resolved_python = str(Path(sys.executable).resolve())
+        translation_command = command[command.index("/TR") + 1]
+        self.assertIn(
+            f"{resolved_python} -m zotero_mcp.zotero_translate run",
+            translation_command,
+        )
+        self.assertNotIn("src/zotero_mcp/zotero_translate.py", translation_command)
         self.assertIn("/Z", command)
         self.assertIn("ONCE", command)
         self.assertEqual(result["scheduler"], "windows-task-scheduler")

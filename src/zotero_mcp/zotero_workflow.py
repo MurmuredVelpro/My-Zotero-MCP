@@ -26,7 +26,6 @@ from . import (
     zotero_translate,
 )
 
-SCHEMA_VERSION = workflow_database.SCHEMA_VERSION
 DEFAULT_EXPORT_NAME = "zotero_workflow_status.csv"
 ITEM_KEY_RE = re.compile(r"^[A-Z0-9]{8}$")
 AUTOMATED_TRANSLATION_RE = re.compile(
@@ -181,22 +180,12 @@ def _pdf2zh_status() -> tuple[list[dict[str, Any]], dict[str, Any]]:
     if not isinstance(history, list):
         raise WorkflowError("PDF2zh history returned invalid data")
 
-    active: list[dict[str, Any]] = []
-    with client.session.get(
-        f"{base_url}/events", stream=True, timeout=(5, 5)
-    ) as response:
-        response.raise_for_status()
-        for raw_line in response.iter_lines(decode_unicode=True):
-            line = str(raw_line or "").strip()
-            if not line.startswith("data:"):
-                continue
-            payload = json.loads(line.removeprefix("data:").strip())
-            if isinstance(payload, dict) and payload.get("type") == "tasks":
-                data = payload.get("data")
-                if not isinstance(data, list):
-                    raise WorkflowError("PDF2zh events returned invalid task data")
-                active = data
-                break
+    tasks_response = client.session.get(f"{base_url}/api/tasks", timeout=10)
+    tasks_response.raise_for_status()
+    tasks_payload = tasks_response.json()
+    active = tasks_payload.get("tasks") if isinstance(tasks_payload, dict) else None
+    if not isinstance(active, list):
+        raise WorkflowError("PDF2zh tasks returned invalid data")
 
     tasks: list[dict[str, Any]] = []
     for task in active:
@@ -855,17 +844,6 @@ CREATE TABLE IF NOT EXISTS translation_queue (
     next_attempt_at TEXT NOT NULL DEFAULT '',
     observed_at TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS pdf2zh_tasks (
-    task_key TEXT PRIMARY KEY,
-    item_key TEXT,
-    source_attachment_key TEXT,
-    filename TEXT NOT NULL,
-    active INTEGER NOT NULL CHECK (active IN (0, 1)),
-    status TEXT NOT NULL,
-    started_at TEXT NOT NULL,
-    ended_at TEXT NOT NULL,
-    observed_at TEXT NOT NULL
-);
 CREATE TABLE IF NOT EXISTS system_health (
     system_name TEXT PRIMARY KEY,
     status TEXT NOT NULL,
@@ -894,8 +872,6 @@ def store_snapshot(path: Path, snapshot: WorkflowSnapshot) -> None:
     with _connect(path) as connection:
         connection.executescript(SCHEMA_SQL)
         connection.executescript(workflow_database.MINERU_SCHEMA_SQL)
-        workflow_database.ensure_translation_queue_columns(connection)
-        connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         connection.execute("UPDATE items SET in_scope = 0")
         for table in (
             "item_collections",
@@ -903,7 +879,6 @@ def store_snapshot(path: Path, snapshot: WorkflowSnapshot) -> None:
             "mineru_documents",
             "qmd_documents",
             "translation_queue",
-            "pdf2zh_tasks",
             "system_health",
             "tracked_collections",
         ):
@@ -1000,18 +975,6 @@ def store_snapshot(path: Path, snapshot: WorkflowSnapshot) -> None:
             )
             """,
             snapshot.translation_queue,
-        )
-        connection.executemany(
-            """
-            INSERT INTO pdf2zh_tasks(
-                task_key, item_key, source_attachment_key, filename, active, status,
-                started_at, ended_at, observed_at
-            ) VALUES(
-                :task_key, :item_key, :source_attachment_key, :filename, :active,
-                :status, :started_at, :ended_at, :observed_at
-            )
-            """,
-            snapshot.pdf2zh_tasks,
         )
         connection.executemany(
             """

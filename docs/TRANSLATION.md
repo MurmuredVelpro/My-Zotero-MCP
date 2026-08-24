@@ -95,7 +95,11 @@ Each paper slot cools down independently. After a translated PDF is downloaded a
 
 `--max-items` limits the unique papers selected by this invocation. A delayed retry of the same paper does not consume another item. The queue persists `attempt_count`, `downloaded_at`, and `next_attempt_at`, so a restarted Worker honors an existing retry or cooldown time.
 
-The Worker requests one Chinese monolingual PDF without a watermark. It reads the returned `fileList`, downloads the selected file from `/translatedFile/<filename>`, validates the PDF, then applies the configured attachment title and filename template.
+The Worker requests one Chinese monolingual PDF without a watermark. `POST /translate` carries `asyncJob=true` and `X-PDF2zh-Protocol: accepted`, then the Worker polls `/api/tasks` and `/api/history` by the returned `taskId`. After a successful task, it reads `fileList` or `filePaths`, downloads the selected file from `/translatedFile/<filename>`, validates the PDF, then applies the configured attachment title and filename template. Any response outside this task API contract is handled as an invalid response.
+
+The deterministic input filename is also the recovery key. After a lost connection or Worker restart, the Worker checks active tasks, history, and the known translated output before submitting. One matching task can be resumed; multiple matches block the paper instead of risking duplicate translation.
+
+PDF2zh `taskId` values and task progress remain runtime-only. The shared SQLite database stores the verified paper translation state and queue recovery fields, but no Server task table or Server task identifier.
 
 ## Repair names after manual translation
 

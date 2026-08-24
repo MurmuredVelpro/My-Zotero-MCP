@@ -13,14 +13,8 @@ from typing import Any
 
 from . import zotero_translate
 
-SCHEMA_VERSION = 3
 DEFAULT_DATABASE_NAME = "zotero_workflow.sqlite3"
 BATCH_ID_RE = re.compile(r"^[A-Za-z0-9_-]+$")
-TRANSLATION_QUEUE_COLUMNS = {
-    "attempt_count": "INTEGER NOT NULL DEFAULT 0",
-    "downloaded_at": "TEXT NOT NULL DEFAULT ''",
-    "next_attempt_at": "TEXT NOT NULL DEFAULT ''",
-}
 
 MINERU_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS mineru_item_state (
@@ -56,23 +50,6 @@ CREATE INDEX IF NOT EXISTS mineru_batches_collection_idx
 """
 
 
-def ensure_translation_queue_columns(connection: sqlite3.Connection) -> None:
-    table = connection.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='translation_queue'"
-    ).fetchone()
-    if table is None:
-        return
-    existing = {
-        str(row[1])
-        for row in connection.execute("PRAGMA table_info(translation_queue)")
-    }
-    for name, declaration in TRANSLATION_QUEUE_COLUMNS.items():
-        if name not in existing:
-            connection.execute(
-                f"ALTER TABLE translation_queue ADD COLUMN {name} {declaration}"
-            )
-
-
 def utc_now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
 
@@ -89,10 +66,6 @@ def connect(path: Path | None = None) -> sqlite3.Connection:
     connection.execute("PRAGMA foreign_keys = ON")
     connection.execute("PRAGMA busy_timeout = 5000")
     connection.executescript(MINERU_SCHEMA_SQL)
-    ensure_translation_queue_columns(connection)
-    current_version = connection.execute("PRAGMA user_version").fetchone()[0]
-    if current_version < SCHEMA_VERSION:
-        connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     if os.name != "nt":
         os.chmod(selected, 0o600)
     return connection

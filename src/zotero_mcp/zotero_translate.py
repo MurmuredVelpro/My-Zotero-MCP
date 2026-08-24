@@ -109,6 +109,10 @@ TRANSIENT_TRANSLATION_PATTERNS = (
     "timed out",
     "timeout",
 )
+PDF2ZH_ASYNC_HEADERS = {"X-PDF2zh-Protocol": "accepted"}
+PDF2ZH_POLL_INTERVAL_SECONDS = 1.0
+PDF2ZH_JOB_TIMEOUT_SECONDS = 12 * 60 * 60
+PDF2ZH_SUBMISSION_RECOVERY_SECONDS = 10.0
 
 
 class TranslationError(RuntimeError):
@@ -708,6 +712,7 @@ def build_translation_payload(
         "noMono": False,
         "noDual": True,
         "noWatermark": True,
+        "asyncJob": True,
     }
     if settings.llm_api is not None:
         payload["llm_api"] = settings.llm_api
@@ -736,18 +741,226 @@ class PDF2ZHClient:
             except (requests.RequestException, ValueError) as exc:
                 failures.append(f"{base_url}: {type(exc).__name__}")
                 continue
-            if isinstance(data, dict) and data.get("status") == "ok":
-                self.base_url = base_url
-                return base_url
-            failures.append(f"{base_url}: invalid health response")
+            if not isinstance(data, dict) or data.get("status") != "ok":
+                failures.append(f"{base_url}: invalid health response")
+                continue
+            self.base_url = base_url
+            try:
+                self._records("/api/tasks", "tasks")
+                self._records("/api/history", "history")
+            except TranslationError:
+                failures.append(f"{base_url}: invalid task API response")
+                self.base_url = ""
+                continue
+            return base_url
         raise TranslationError(
             "PDF2zh Server health check failed: " + "; ".join(failures)
         )
 
     @staticmethod
-    def input_filename(parent_key: str, source_key: str, source_pdf: Path) -> str:
-        stem = re.sub(r"[^A-Za-z0-9._-]+", "_", source_pdf.stem).strip("._")
-        return f"{parent_key}_{source_key}_{(stem[:80] or 'paper')}.pdf"
+    def input_filename(source_pdf: Path) -> str:
+        return source_pdf.name
+
+    def _records(self, path: str, field: str) -> list[dict[str, Any]]:
+        try:
+            response = self.session.get(f"{self.base_url}{path}", timeout=10)
+            data = response.json()
+        except (requests.RequestException, ValueError) as exc:
+            raise TranslationError(f"PDF2zh Server request failed: {path}") from exc
+        records = data.get(field) if isinstance(data, dict) else None
+        if (
+            not response.ok
+            or data.get("status") != "success"
+            or not isinstance(records, list)
+        ):
+            raise TranslationError(f"PDF2zh Server returned invalid {field} response")
+        return [record for record in records if isinstance(record, dict)]
+
+    def _matching_jobs(self, input_name: str) -> list[dict[str, Any]]:
+        matches: dict[str, dict[str, Any]] = {}
+        for source, records in (
+            ("tasks", self._records("/api/tasks", "tasks")),
+            ("history", self._records("/api/history", "history")),
+        ):
+            for index, record in enumerate(records):
+                if record.get("fileName") != input_name:
+                    continue
+                task_id = str(record.get("taskId") or "").strip()
+                key = task_id or f"{source}:{index}"
+                matches[key] = {**matches.get(key, {}), **record}
+        return list(matches.values())
+
+    @staticmethod
+    def _job_state(record: Mapping[str, Any]) -> str:
+        result = record.get("result")
+        result_status = (
+            str(result.get("status") or "").strip().lower()
+            if isinstance(result, Mapping)
+            else ""
+        )
+        status = str(record.get("status") or "").strip().lower()
+        if result_status == "success" or status in {"success", "完成"}:
+            return "success"
+        if result_status in {"error", "failed"} or status in {
+            "error",
+            "failed",
+            "失败",
+        }:
+            return "failed"
+        if record.get("active") is False or record.get("finished") is True:
+            return "failed"
+        return "active"
+
+    @staticmethod
+    def _job_files(record: Mapping[str, Any]) -> list[str]:
+        containers = [record]
+        result = record.get("result")
+        if isinstance(result, Mapping):
+            containers.append(result)
+        for container in containers:
+            files = container.get("fileList")
+            if isinstance(files, list):
+                names = [name for name in files if isinstance(name, str) and name]
+                if names:
+                    return names
+            paths = container.get("filePaths")
+            if isinstance(paths, list):
+                names = [
+                    Path(path).name for path in paths if isinstance(path, str) and path
+                ]
+                if names:
+                    return names
+        return []
+
+    @staticmethod
+    def _job_error(record: Mapping[str, Any]) -> str:
+        return str(record.get("error") or record.get("message") or "unknown error")
+
+    @staticmethod
+    def _expected_remote_name(input_name: str, settings: PDF2ZHSettings) -> str:
+        target_lang = str(settings.request_options.get("targetLang") or "zh-CN")
+        return f"{Path(input_name).stem}.no_watermark.{target_lang}.mono.pdf"
+
+    def _download(
+        self,
+        remote_name: str,
+        parent_key: str,
+        source_key: str,
+        source_pdf: Path,
+        *,
+        missing_ok: bool = False,
+    ) -> Path | None:
+        download = self.session.get(
+            f"{self.base_url}/translatedFile/{quote(remote_name, safe='')}",
+            timeout=(10, 30 * 60),
+            stream=True,
+        )
+        if missing_ok and download.status_code == 404:
+            return None
+        download.raise_for_status()
+        item_dir = self.output_dir / f"{parent_key}_{source_key}"
+        item_dir.mkdir(parents=True, exist_ok=True)
+        output = item_dir / self.naming.filename_for(source_pdf.stem)
+        temporary = output.with_name(f".{output.name}.{os.getpid()}.tmp")
+        try:
+            with temporary.open("wb") as handle:
+                for chunk in download.iter_content(chunk_size=65536):
+                    if chunk:
+                        handle.write(chunk)
+                handle.flush()
+                os.fsync(handle.fileno())
+            validate_pdf(temporary)
+            os.replace(temporary, output)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return output
+
+    def _download_job(
+        self,
+        record: Mapping[str, Any],
+        parent_key: str,
+        source_key: str,
+        source_pdf: Path,
+    ) -> Path:
+        files = self._job_files(record)
+        mono = [name for name in files if name.lower().endswith(".mono.pdf")]
+        if len(mono) != 1:
+            raise TranslationError(f"PDF2zh returned unexpected files: {files!r}")
+        output = self._download(mono[0], parent_key, source_key, source_pdf)
+        if output is None:
+            raise TranslationError(f"PDF2zh translated file is missing: {mono[0]}")
+        return output
+
+    def _poll_job(
+        self,
+        task_id: str,
+        parent_key: str,
+        source_key: str,
+        source_pdf: Path,
+    ) -> Path:
+        deadline = time.monotonic() + PDF2ZH_JOB_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            try:
+                records = self._records("/api/tasks", "tasks") + self._records(
+                    "/api/history", "history"
+                )
+            except TranslationError:
+                time.sleep(PDF2ZH_POLL_INTERVAL_SECONDS)
+                continue
+            record = next(
+                (item for item in records if str(item.get("taskId") or "") == task_id),
+                None,
+            )
+            if record is not None:
+                state = self._job_state(record)
+                if state == "success":
+                    return self._download_job(
+                        record, parent_key, source_key, source_pdf
+                    )
+                if state == "failed":
+                    raise TranslationError(
+                        f"PDF2zh translation failed: {self._job_error(record)}"
+                    )
+            time.sleep(PDF2ZH_POLL_INTERVAL_SECONDS)
+        raise TranslationError(f"PDF2zh translation timed out: taskId={task_id}")
+
+    def _recover_after_disconnect(
+        self,
+        input_name: str,
+        parent_key: str,
+        source_key: str,
+        source_pdf: Path,
+        original: requests.RequestException,
+    ) -> Path:
+        deadline = time.monotonic() + PDF2ZH_SUBMISSION_RECOVERY_SECONDS
+        while time.monotonic() < deadline:
+            try:
+                jobs = self._matching_jobs(input_name)
+            except TranslationError:
+                time.sleep(PDF2ZH_POLL_INTERVAL_SECONDS)
+                continue
+            if len(jobs) > 1:
+                raise TranslationError(
+                    f"multiple PDF2zh tasks found for input file: {input_name}"
+                ) from original
+            if jobs:
+                record = jobs[0]
+                state = self._job_state(record)
+                if state == "success":
+                    return self._download_job(
+                        record, parent_key, source_key, source_pdf
+                    )
+                if state == "failed":
+                    raise TranslationError(
+                        f"PDF2zh translation failed: {self._job_error(record)}"
+                    ) from original
+                task_id = str(record.get("taskId") or "").strip()
+                if task_id:
+                    return self._poll_job(task_id, parent_key, source_key, source_pdf)
+            time.sleep(PDF2ZH_POLL_INTERVAL_SECONDS)
+        raise TranslationError(
+            "PDF2zh submission connection failed; task recovery found no unique job"
+        ) from original
 
     def translate(
         self,
@@ -760,7 +973,46 @@ class PDF2ZHClient:
     ) -> Path:
         if not self.base_url:
             self.health(settings)
-        input_name = self.input_filename(parent_key, source_key, source_pdf)
+        input_name = self.input_filename(source_pdf)
+        jobs = self._matching_jobs(input_name)
+        if len(jobs) > 1:
+            raise TranslationError(
+                f"multiple PDF2zh tasks found for input file: {input_name}"
+            )
+        if jobs:
+            record = jobs[0]
+            state = self._job_state(record)
+            if state == "success":
+                return self._download_job(record, parent_key, source_key, source_pdf)
+            if state == "active":
+                task_id = str(record.get("taskId") or "").strip()
+                if not task_id:
+                    raise TranslationError(
+                        f"PDF2zh active task has no taskId: {input_name}"
+                    )
+                return self._poll_job(task_id, parent_key, source_key, source_pdf)
+            existing = self._download(
+                self._expected_remote_name(input_name, settings),
+                parent_key,
+                source_key,
+                source_pdf,
+                missing_ok=True,
+            )
+            if existing is not None:
+                return existing
+            # A failed historical task cannot be resumed. A new submission is
+            # allowed after failure; active or ambiguous tasks are never duplicated.
+        else:
+            existing = self._download(
+                self._expected_remote_name(input_name, settings),
+                parent_key,
+                source_key,
+                source_pdf,
+                missing_ok=True,
+            )
+            if existing is not None:
+                return existing
+
         payload = build_translation_payload(
             input_name,
             base64.b64encode(source_pdf.read_bytes()).decode("ascii"),
@@ -768,11 +1020,17 @@ class PDF2ZHClient:
             qps,
             pool_size,
         )
-        response = self.session.post(
-            f"{self.base_url}/translate",
-            json=payload,
-            timeout=(10, 12 * 60 * 60),
-        )
+        try:
+            response = self.session.post(
+                f"{self.base_url}/translate",
+                json=payload,
+                headers=PDF2ZH_ASYNC_HEADERS,
+                timeout=(10, 60),
+            )
+        except requests.RequestException as exc:
+            return self._recover_after_disconnect(
+                input_name, parent_key, source_key, source_pdf, exc
+            )
         try:
             data = response.json()
         except ValueError as exc:
@@ -783,46 +1041,19 @@ class PDF2ZHClient:
             raise TranslationError(
                 f"PDF2zh Server returned HTTP {response.status_code} with invalid JSON data"
             )
-        if not response.ok or data.get("status") != "success":
-            message = settings.redact(
-                str(data.get("message") or f"HTTP {response.status_code}")
+        status = str(data.get("status") or "").strip()
+        if not response.ok or status != "accepted":
+            fallback = (
+                f"HTTP {response.status_code}"
+                if not response.ok
+                else f"unexpected status {status or '<missing>'}"
             )
+            message = settings.redact(str(data.get("message") or fallback))
             raise TranslationError(f"PDF2zh translation failed: {message}")
-        files = data.get("fileList")
-        mono = (
-            [
-                name
-                for name in files
-                if isinstance(name, str) and name.lower().endswith(".mono.pdf")
-            ]
-            if isinstance(files, list)
-            else []
-        )
-        if len(mono) != 1:
-            raise TranslationError(f"PDF2zh returned unexpected files: {files!r}")
-
-        item_dir = self.output_dir / f"{parent_key}_{source_key}"
-        item_dir.mkdir(parents=True, exist_ok=True)
-        output = item_dir / self.naming.filename_for(source_pdf.stem)
-        temporary = output.with_name(f".{output.name}.{os.getpid()}.tmp")
-        try:
-            download = self.session.get(
-                f"{self.base_url}/translatedFile/{quote(mono[0], safe='')}",
-                timeout=(10, 30 * 60),
-                stream=True,
-            )
-            download.raise_for_status()
-            with temporary.open("wb") as handle:
-                for chunk in download.iter_content(chunk_size=65536):
-                    if chunk:
-                        handle.write(chunk)
-                handle.flush()
-                os.fsync(handle.fileno())
-            validate_pdf(temporary)
-            os.replace(temporary, output)
-        finally:
-            temporary.unlink(missing_ok=True)
-        return output
+        task_id = str(data.get("taskId") or "").strip()
+        if not task_id:
+            raise TranslationError("PDF2zh Server accepted task without taskId")
+        return self._poll_job(task_id, parent_key, source_key, source_pdf)
 
 
 class ZoteroClient:
@@ -2164,7 +2395,12 @@ class TranslationWorker:
         pool_size: int,
     ) -> TranslationDownload:
         output = self._translation_server(server_url).translate(
-            settings, parent_key, source_key, source_pdf, qps, pool_size
+            settings,
+            parent_key,
+            source_key,
+            source_pdf,
+            qps,
+            pool_size,
         )
         validate_pdf(output)
         return TranslationDownload(output=output, downloaded_at=utc_timestamp())
@@ -2471,10 +2707,10 @@ def schedule_translation(
     prefs_path: Path | None = None,
 ) -> dict[str, Any]:
     resolved_prefs = load_pdf2zh_settings(prefs_path).prefs_path
-    script = Path(__file__).resolve()
     command = [
         str(Path(sys.executable).resolve()),
-        str(script),
+        "-m",
+        "zotero_mcp.zotero_translate",
         "run",
         "--queue",
         str(queue.expanduser().resolve()),

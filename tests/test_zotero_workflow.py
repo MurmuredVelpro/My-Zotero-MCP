@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from zotero_mcp import workflow_database, zotero_workflow
+from zotero_mcp import zotero_workflow
 
 
 class WorkflowStoreTests(unittest.TestCase):
@@ -239,22 +239,9 @@ class WorkflowStoreTests(unittest.TestCase):
             self.assertEqual(data["qmd"]["state"], "indexed_current")
             self.assertEqual(len(data["attachments"]), 3)
 
-    def test_translation_queue_schema_migrates_and_stores_retry_state(self):
+    def test_translation_queue_stores_retry_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             database = Path(tmp) / "workflow.sqlite3"
-            with sqlite3.connect(database) as connection:
-                connection.execute(
-                    """
-                    CREATE TABLE translation_queue (
-                        item_key TEXT PRIMARY KEY,
-                        source_attachment_key TEXT NOT NULL,
-                        state TEXT NOT NULL,
-                        output_pdf TEXT NOT NULL,
-                        last_error TEXT NOT NULL,
-                        observed_at TEXT NOT NULL
-                    )
-                    """
-                )
             snapshot = self.snapshot()
             snapshot.translation_queue.append(
                 {
@@ -284,7 +271,6 @@ class WorkflowStoreTests(unittest.TestCase):
                     "SELECT state, attempt_count, downloaded_at, next_attempt_at "
                     "FROM translation_queue WHERE item_key='AB12CD34'"
                 ).fetchone()
-                version = connection.execute("PRAGMA user_version").fetchone()[0]
         self.assertEqual(columns.count("attempt_count"), 1)
         self.assertEqual(columns.count("downloaded_at"), 1)
         self.assertEqual(columns.count("next_attempt_at"), 1)
@@ -292,38 +278,6 @@ class WorkflowStoreTests(unittest.TestCase):
             row,
             ("retry_wait", 1, "", "2026-08-20T12:10:00+00:00"),
         )
-        self.assertEqual(version, zotero_workflow.SCHEMA_VERSION)
-
-    def test_shared_database_connect_also_migrates_translation_queue(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            database = Path(tmp) / "workflow.sqlite3"
-            with sqlite3.connect(database) as connection:
-                connection.execute(
-                    """
-                    CREATE TABLE translation_queue (
-                        item_key TEXT PRIMARY KEY,
-                        source_attachment_key TEXT NOT NULL,
-                        state TEXT NOT NULL,
-                        output_pdf TEXT NOT NULL,
-                        last_error TEXT NOT NULL,
-                        observed_at TEXT NOT NULL
-                    )
-                    """
-                )
-
-            with workflow_database.connect(database) as connection:
-                columns = [
-                    row[1]
-                    for row in connection.execute(
-                        "PRAGMA table_info(translation_queue)"
-                    ).fetchall()
-                ]
-                version = connection.execute("PRAGMA user_version").fetchone()[0]
-
-        self.assertIn("attempt_count", columns)
-        self.assertIn("downloaded_at", columns)
-        self.assertIn("next_attempt_at", columns)
-        self.assertEqual(version, workflow_database.SCHEMA_VERSION)
 
     def test_later_sync_marks_removed_item_out_of_scope(self):
         with tempfile.TemporaryDirectory() as tmp:
