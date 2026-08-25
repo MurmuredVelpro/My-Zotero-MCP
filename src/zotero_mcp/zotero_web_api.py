@@ -167,6 +167,8 @@ def web_api_request(
                 timeout=timeout,
             )
         except requests.RequestException as exc:
+            if method_upper in {"GET", "HEAD"} and attempt + 1 < max_attempts:
+                continue
             if method_upper in {"POST", "PATCH", "PUT", "DELETE"}:
                 message = "Zotero Web API request failed with unknown write state"
             else:

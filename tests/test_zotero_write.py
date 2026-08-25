@@ -187,12 +187,13 @@ class WebApiTransportTests(unittest.TestCase):
                 zotero_web_api.requests,
                 "request",
                 side_effect=zotero_web_api.requests.Timeout("timed out"),
-            ),
+            ) as write_request,
             self.assertRaisesRegex(
                 zotero_web_api.ZoteroWriteError, "unknown write state"
             ),
         ):
             zotero_web_api.web_api_request("POST", "users/1/items", payload=[])
+        write_request.assert_called_once()
 
         with (
             mock.patch.object(zotero_web_api, "web_api_key", return_value="secret"),
@@ -204,6 +205,23 @@ class WebApiTransportTests(unittest.TestCase):
             self.assertRaisesRegex(zotero_web_api.ZoteroWriteError, "read failed"),
         ):
             zotero_web_api.web_api_request("GET", "users/1/items")
+
+    def test_read_retries_once_after_network_error(self):
+        responses = [
+            zotero_web_api.requests.Timeout("timed out"),
+            FakeResponse(200),
+        ]
+        with (
+            mock.patch.object(zotero_web_api, "web_api_key", return_value="secret"),
+            mock.patch.object(
+                zotero_web_api.requests,
+                "request",
+                side_effect=responses,
+            ) as request,
+        ):
+            response = zotero_web_api.web_api_request("GET", "users/1/items")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(request.call_count, 2)
 
     def test_read_retries_once_after_retry_after(self):
         responses = [
