@@ -99,7 +99,7 @@ class MinerUClientTests(unittest.TestCase):
                 mock.patch.object(mineru_client, "ApiClient", return_value=client),
                 mock.patch.object(mineru_client, "load_token", return_value="token"),
                 mock.patch.object(
-                    mineru_client.requests,
+                    mineru_client.zotero_http,
                     "put",
                     side_effect=capture_upload,
                 ) as put,
@@ -146,7 +146,7 @@ class MinerUClientTests(unittest.TestCase):
             pdf.write_bytes(b"%PDF-test")
             with (
                 mock.patch.object(
-                    mineru_client.requests,
+                    mineru_client.zotero_http,
                     "put",
                     return_value=self.StreamingResponse(b"", status_code=500),
                 ),
@@ -192,7 +192,7 @@ class MinerUClientTests(unittest.TestCase):
             content = self.mineru_zip()
             with (
                 mock.patch.object(
-                    mineru_client.requests,
+                    mineru_client.zotero_http,
                     "get",
                     return_value=self.StreamingResponse(content),
                 ) as get,
@@ -220,7 +220,7 @@ class MinerUClientTests(unittest.TestCase):
             content = self.mineru_zip()
             with (
                 mock.patch.object(
-                    mineru_client.requests,
+                    mineru_client.zotero_http,
                     "get",
                     return_value=self.StreamingResponse(content),
                 ),
@@ -241,7 +241,7 @@ class MinerUClientTests(unittest.TestCase):
             content = self.mineru_zip(include_model=False)
             with (
                 mock.patch.object(
-                    mineru_client.requests,
+                    mineru_client.zotero_http,
                     "get",
                     return_value=self.StreamingResponse(content),
                 ),
@@ -264,7 +264,11 @@ class MinerUClientTests(unittest.TestCase):
                 headers={"Content-Length": "999999"},
             )
             with (
-                mock.patch.object(mineru_client.requests, "get", return_value=response),
+                mock.patch.object(
+                    mineru_client.zotero_http,
+                    "get",
+                    return_value=response,
+                ),
                 self.assertRaisesRegex(mineru_client.MinerUError, "incomplete"),
             ):
                 mineru_client.download_and_extract(

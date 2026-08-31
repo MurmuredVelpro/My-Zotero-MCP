@@ -18,7 +18,9 @@ class PlatformDetectionTests(unittest.TestCase):
         with (
             mock.patch.object(zotero_local, "is_windows", return_value=False),
             mock.patch.object(
-                zotero_local, "wsl_gateway_ip", return_value="172.30.1.1"
+                zotero_local.zotero_http,
+                "wsl_gateway_ip",
+                return_value="172.30.1.1",
             ),
         ):
             self.assertEqual(
@@ -142,8 +144,8 @@ class PlatformDetectionTests(unittest.TestCase):
                 return_value=["http://first/api", "http://second/api"],
             ),
             mock.patch.object(
-                zotero_local.requests,
-                "get",
+                zotero_local.zotero_http.requests,
+                "request",
                 side_effect=[
                     zotero_local.requests.ConnectionError("offline"),
                     response,

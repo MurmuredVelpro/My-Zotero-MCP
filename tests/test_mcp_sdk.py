@@ -33,7 +33,7 @@ class McpSdkIntegrationTests(unittest.TestCase):
 
         listed, hidden = anyio.run(run)
         names = [tool.name for tool in listed.tools]
-        self.assertEqual(len(names), 13)
+        self.assertEqual(len(names), 14)
         self.assertIn("zotero_plan_paper_import", names)
         self.assertNotIn("zotero_get_annotations", names)
         self.assertTrue(hidden.isError)
@@ -78,7 +78,7 @@ class McpSdkIntegrationTests(unittest.TestCase):
         ) = anyio.run(run)
         tools = {tool.name: tool for tool in listed.tools}
         self.assertEqual(initialized.serverInfo.name, "zotero_mcp")
-        self.assertEqual(len(tools), 26)
+        self.assertEqual(len(tools), 28)
         self.assertIn("zotero_apply_pdf_attachment_delete", tools)
         self.assertIn("zotero_apply_manual_translation_rename", tools)
         self.assertIn("zotero_web_api_status", tools)

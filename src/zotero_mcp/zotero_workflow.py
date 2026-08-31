@@ -49,6 +49,10 @@ EXPORT_FIELDS = (
     "parsed_attachment_key",
     "qmd_state",
     "qmd_document_ref",
+    "pdf_acquisition_state",
+    "pdf_candidate_url",
+    "pdf_acquisition_checked_at",
+    "pdf_acquisition_error",
     "issue",
     "last_seen_at",
 )
@@ -863,6 +867,9 @@ def _connect(path: Path) -> sqlite3.Connection:
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
     connection.execute("PRAGMA busy_timeout = 5000")
+    connection.executescript(SCHEMA_SQL)
+    connection.executescript(workflow_database.MINERU_SCHEMA_SQL)
+    connection.executescript(workflow_database.PDF_ACQUISITION_SCHEMA_SQL)
     return connection
 
 
@@ -870,8 +877,6 @@ def store_snapshot(path: Path, snapshot: WorkflowSnapshot) -> None:
     path = path.expanduser()
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     with _connect(path) as connection:
-        connection.executescript(SCHEMA_SQL)
-        connection.executescript(workflow_database.MINERU_SCHEMA_SQL)
         connection.execute("UPDATE items SET in_scope = 0")
         for table in (
             "item_collections",
@@ -1140,6 +1145,9 @@ def status_data(path: Path, item_key: str | None = None) -> dict[str, Any]:
             qmd = connection.execute(
                 "SELECT * FROM qmd_documents WHERE item_key=?", (item_key,)
             ).fetchone()
+            pdf_acquisition = connection.execute(
+                "SELECT * FROM pdf_acquisition WHERE item_key=?", (item_key,)
+            ).fetchone()
             return {
                 "database": str(path),
                 "last_sync_at": last_sync["value"] if last_sync else "",
@@ -1148,6 +1156,7 @@ def status_data(path: Path, item_key: str | None = None) -> dict[str, Any]:
                 "attachments": attachments,
                 "mineru": dict(mineru) if mineru else None,
                 "qmd": dict(qmd) if qmd else None,
+                "pdf_acquisition": dict(pdf_acquisition) if pdf_acquisition else None,
             }
 
         counts: dict[str, Any] = {
@@ -1169,6 +1178,13 @@ def status_data(path: Path, item_key: str | None = None) -> dict[str, Any]:
                     f"GROUP BY {field} ORDER BY {field}"
                 )
             }
+        counts["pdf_acquisition_state"] = {
+            row[0]: row[1]
+            for row in connection.execute(
+                "SELECT state, COUNT(*) FROM pdf_acquisition "
+                "GROUP BY state ORDER BY state"
+            )
+        }
     return {
         "database": str(path),
         "last_sync_at": last_sync["value"] if last_sync else "",
@@ -1217,11 +1233,16 @@ def export_csv(path: Path, output: Path) -> int:
                     COALESCE(m.parsed_attachment_key, '') AS parsed_attachment_key,
                     i.qmd_state,
                     COALESCE(q.document_ref, '') AS qmd_document_ref,
+                    COALESCE(p.state, 'unchecked') AS pdf_acquisition_state,
+                    COALESCE(p.candidate_url, '') AS pdf_candidate_url,
+                    COALESCE(p.checked_at, '') AS pdf_acquisition_checked_at,
+                    COALESCE(p.last_error, '') AS pdf_acquisition_error,
                     i.issue,
                     i.last_seen_at
                 FROM items i
                 LEFT JOIN mineru_documents m ON m.item_key=i.item_key
                 LEFT JOIN qmd_documents q ON q.item_key=i.item_key
+                LEFT JOIN pdf_acquisition p ON p.item_key=i.item_key
                 WHERE i.in_scope=1
                 ORDER BY i.title COLLATE NOCASE, i.item_key
                 """
@@ -1253,6 +1274,12 @@ def format_status(data: dict[str, Any]) -> str:
             f"mineru: {item['mineru_state']}",
             f"qmd: {item['qmd_state']}",
             f"issue: {item['issue'] or 'none'}",
+            "pdf_acquisition: "
+            + (
+                data["pdf_acquisition"]["state"]
+                if data["pdf_acquisition"]
+                else "unchecked"
+            ),
             "collections:",
         ]
         lines.extend(f"- {row['collection_path']}" for row in data["collections"])
@@ -1279,6 +1306,10 @@ def format_status(data: dict[str, Any]) -> str:
     for field in ("translation_state", "mineru_state", "qmd_state"):
         lines.append(f"{field}:")
         lines.extend(f"- {key}: {value}" for key, value in counts[field].items())
+    lines.append("pdf_acquisition_state:")
+    lines.extend(
+        f"- {key}: {value}" for key, value in counts["pdf_acquisition_state"].items()
+    )
     lines.append("system_health:")
     lines.extend(
         f"- {row['system_name']}: {row['status']}"

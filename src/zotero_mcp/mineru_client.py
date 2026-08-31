@@ -15,9 +15,9 @@ from pathlib import Path
 from typing import Any
 
 import requests
-from mineru._api import ApiClient
+from mineru.exceptions import raise_for_code
 
-from . import zotero_runtime
+from . import zotero_http, zotero_runtime
 
 API_BASE = "https://mineru.net/api/v4"
 SDK_SOURCE = "zotero-mcp-local"
@@ -25,6 +25,7 @@ DEFAULT_TOKEN_FILE = "mineru_api_token.secret"
 MODEL_VERSIONS = {"pipeline", "vlm"}
 MAX_BATCH_FILES = 50
 TRANSFER_TIMEOUT = (10, 300)
+API_TIMEOUT = (30, 120)
 REQUIRED_RESULT_ARTIFACTS = (
     "result.zip",
     "full.md",
@@ -38,6 +39,62 @@ REQUIRED_RESULT_ARTIFACTS = (
 
 class MinerUError(RuntimeError):
     """Raised when MinerU rejects a request or returns an invalid response."""
+
+
+class ApiClient:
+    """MinerU API transport routed through Zotero MCP's NORMAL profile."""
+
+    def __init__(self, token: str, base_url: str, source: str = "") -> None:
+        self.base_url = base_url.rstrip("/")
+        self.source = source
+        self.session = zotero_http.routed_session(zotero_http.RouteType.NORMAL)
+        self.session.headers.update(
+            {
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            }
+        )
+
+    def close(self) -> None:
+        self.session.close()
+
+    def post(self, path: str, json: dict[str, Any]) -> dict[str, Any]:
+        headers = {"source": self.source} if self.source else None
+        response = zotero_http.session_request(
+            self.session,
+            "POST",
+            f"{self.base_url}/{path.lstrip('/')}",
+            route=zotero_http.RouteType.NORMAL,
+            json=json,
+            headers=headers,
+            timeout=API_TIMEOUT,
+        )
+        return self._handle(response)
+
+    def get(self, path: str) -> dict[str, Any]:
+        response = zotero_http.session_request(
+            self.session,
+            "GET",
+            f"{self.base_url}/{path.lstrip('/')}",
+            route=zotero_http.RouteType.NORMAL,
+            timeout=API_TIMEOUT,
+        )
+        return self._handle(response)
+
+    @staticmethod
+    def _handle(response: requests.Response) -> dict[str, Any]:
+        response.raise_for_status()
+        body = response.json()
+        if not isinstance(body, dict):
+            raise MinerUError("MinerU API returned a non-object response")
+        code = body.get("code", 0)
+        if code != 0:
+            raise_for_code(
+                code,
+                str(body.get("msg", "unknown error")),
+                str(body.get("trace_id", "")),
+            )
+        return body
 
 
 def output_root() -> Path:
@@ -167,8 +224,9 @@ def upload_file(file_path: Path, upload_url: str) -> int:
 
     try:
         with file_path.open("rb") as handle:
-            response = requests.put(
+            response = zotero_http.put(
                 upload_url,
+                route=zotero_http.RouteType.NORMAL,
                 data=handle,
                 timeout=TRANSFER_TIMEOUT,
             )
@@ -425,8 +483,9 @@ def download_and_extract(full_zip_url: str, output_dir: Path) -> dict[str, Any]:
         zip_path = staged_dir / "result.zip"
         partial = staged_dir / "result.zip.part"
         try:
-            with requests.get(
+            with zotero_http.get(
                 full_zip_url,
+                route=zotero_http.RouteType.NORMAL,
                 stream=True,
                 timeout=TRANSFER_TIMEOUT,
             ) as response:

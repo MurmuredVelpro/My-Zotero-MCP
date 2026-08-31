@@ -24,7 +24,7 @@ from urllib.parse import quote
 
 import requests
 
-from . import zotero_runtime
+from . import zotero_http, zotero_runtime
 
 LOCAL_API_PORT = "23119"
 WSL_PROXY_PORT = "23120"
@@ -42,25 +42,6 @@ def is_windows() -> bool:
 
 def default_text_out_dir() -> Path:
     return Path(tempfile.gettempdir()) / "zotero_texts"
-
-
-def wsl_gateway_ip() -> str | None:
-    route_path = Path("/proc/net/route")
-    if not route_path.exists():
-        return None
-    for line in route_path.read_text().splitlines()[1:]:
-        fields = line.split()
-        if len(fields) < 3:
-            continue
-        destination, gateway = fields[1], fields[2]
-        if destination != "00000000":
-            continue
-        try:
-            raw = bytes.fromhex(gateway)
-        except ValueError:
-            continue
-        return ".".join(str(part) for part in reversed(raw))
-    return None
 
 
 def default_api_base() -> str:
@@ -83,7 +64,7 @@ def local_api_candidates() -> list[str]:
         return [WINDOWS_DEFAULT_API]
 
     candidates = [WINDOWS_DEFAULT_API]
-    gateway = wsl_gateway_ip()
+    gateway = zotero_http.wsl_gateway_ip()
     if gateway:
         candidates.extend(
             [
@@ -213,8 +194,9 @@ def zotero_get(path: str, params: dict[str, Any] | None = None) -> Any:
     for base in candidates:
         url = f"{base}/{path.lstrip('/')}"
         try:
-            response = requests.get(
+            response = zotero_http.get(
                 url,
+                route=zotero_http.RouteType.LOCAL,
                 params=params,
                 timeout=10,
                 headers={

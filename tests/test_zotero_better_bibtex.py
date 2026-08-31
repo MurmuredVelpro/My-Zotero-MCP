@@ -21,7 +21,7 @@ class BetterBibTeXTests(unittest.TestCase):
                 return_value="http://172.29.112.1:23120/api",
             ),
             mock.patch.object(
-                zotero_better_bibtex.requests,
+                zotero_better_bibtex.zotero_http,
                 "post",
                 return_value=self.response(
                     {"jsonrpc": "2.0", "result": {"ITEM0001": "Smith2024"}, "id": 1}
@@ -49,7 +49,9 @@ class BetterBibTeXTests(unittest.TestCase):
             ),
         ]
         with mock.patch.object(
-            zotero_better_bibtex.requests, "post", side_effect=responses
+            zotero_better_bibtex.zotero_http,
+            "post",
+            side_effect=responses,
         ):
             result = zotero_better_bibtex.export_bibtex("ITEM0001")
 
@@ -59,7 +61,7 @@ class BetterBibTeXTests(unittest.TestCase):
     def test_connection_error_is_actionable(self):
         with (
             mock.patch.object(
-                zotero_better_bibtex.requests,
+                zotero_better_bibtex.zotero_http,
                 "post",
                 side_effect=requests.ConnectionError("offline"),
             ),

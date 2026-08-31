@@ -25,6 +25,7 @@ zotero-mcp = "zotero_mcp.zotero_mcp_server:main"
 zotero-mcp-setup = "zotero_mcp.zotero_setup:main"
 zotero-mineru = "zotero_mcp.mineru_workflow:main"
 zotero-mineru-qmd = "zotero_mcp.mineru_qmd_pipeline:main"
+zotero-pdf = "zotero_mcp.zotero_pdf:main"
 zotero-translate = "zotero_mcp.zotero_translate:main"
 zotero-workflow = "zotero_mcp.zotero_workflow:main"
 

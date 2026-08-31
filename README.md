@@ -54,6 +54,7 @@ zotero-mcp setup plan --profile full
 - 按 key、唯一名称或完整路径解析 collection
 - 读取批注、笔记、PDF 全文、页面与 Better BibTeX citation key
 - 通过 plan/apply 两阶段工具导入论文、调整 collection、删除 PDF 附件
+- 为缺少英文正文的条目发现并受控导入公开正式出版版 PDF；拒绝作者手稿、接受稿和预校样
 - 可选使用 MinerU 批量解析 PDF，并用 QMD 建立全文检索
 - 用本地 SQLite 记录重点 collection 的翻译、MinerU、QMD 和运行健康状态，供不同对话共享
 - 在用户现有 collection 标准下，用 QMD 全文证据协同规划和执行文献整理
@@ -94,6 +95,8 @@ zotero-mcp setup print-codex-config --toolsets literature,review,maintenance
 - `zotero_web_api_status`
 - `zotero_plan_paper_import`
 - `zotero_apply_paper_import`
+- `zotero_plan_pdf_acquisition`
+- `zotero_apply_pdf_acquisition`
 - `zotero_plan_collection_reconcile`
 - `zotero_apply_collection_reconcile`
 - `zotero_plan_pdf_attachment_delete`
@@ -155,6 +158,39 @@ python -m zotero_mcp.zotero_workflow export-csv
 
 同步只写入上述本地 SQLite，不修改 Zotero、PDF、MinerU、QMD 或 PDF2zh，不提交翻译任务。`export-csv` 是显式的只读导出，不参与状态恢复。`role=source_pdf`、`translated_pdf`、`supplementary_pdf` 是工作流判断；`is_primary` 只表示 Zotero 的主附件提示，不能单独用来判断英文正文。
 
+## 正式出版版 PDF 获取
+
+先同步统一状态库，再只读扫描缺少英文正文的条目：
+
+```bash
+zotero-workflow sync
+zotero-pdf scan --collection Senescence --recursive --missing-only
+zotero-pdf status --item ITEMKEY
+```
+
+扫描会查询 Crossref、OpenAlex、PMC、可选 Unpaywall 和出版社文章页，将候选及拒绝原因写入统一 SQLite；不会下载 PDF 或修改 Zotero。只自动接受能够证明为公开 Version of Record 的期刊 PDF，正式期刊条目的作者手稿、接受稿、投稿稿、预校样和旧预印本全部失败关闭。
+
+Unpaywall 需要联系邮箱时，在用户配置中设置：
+
+```toml
+[pdf_acquisition]
+unpaywall_email = "name@example.org"
+```
+
+实际下载和附件导入要求精确条目 key 和明确确认。先预演：
+
+```bash
+zotero-pdf apply --item ITEMKEY --dry-run
+```
+
+确认后执行：
+
+```bash
+zotero-pdf apply --item ITEMKEY --confirm
+```
+
+MCP 对应入口是 `zotero_apply_pdf_acquisition`，同样要求精确 key 和 `confirm=true`。执行时重新核验来源，读取一次 Zotero 当前 `attachmentRenameTemplate`，附件标题固定为 `PDF`，文件名按模板生成。不会覆盖已有英文 PDF，也不会自动触发 MinerU、QMD 或 PDF2zh。
+
 ## 协同整理 collection
 
 QMD 建立全文索引后，Codex 可以读取用户现有分类规则，逐篇回读全文，生成 collection 调整计划。用户审阅后，工具再通过 plan/apply 两阶段执行并回读。
@@ -207,7 +243,7 @@ Zotero Web API key 默认保存在 Zotero MCP 配置目录下的 `zotero_web_api
 
 ## MinerU 批处理
 
-Zotero 批处理通过官方 `mineru-open-sdk` 访问 MinerU，同时保留可恢复上传、Zotero item-key 目录、产物验证和 QMD 流水线。通用文件解析应另行安装官方 `mineru-open-mcp`，作为独立 MCP 使用；它与下列 Zotero 专用命令互不替代。若不希望 MCP 启动时创建空的默认输出目录，可用 `scripts/run_mineru_open_mcp_lazy.py` 启动官方 MCP；它不修改官方安装包，显式传入 `output_dir` 的行为保持不变。
+Zotero 批处理沿用官方 `mineru-open-sdk` 的 API 契约和错误映射，并通过统一的 `NORMAL` HTTP 路由访问 MinerU，同时保留可恢复上传、Zotero item-key 目录、产物验证和 QMD 流水线。通用文件解析应另行安装官方 `mineru-open-mcp`，作为独立 MCP 使用；它与下列 Zotero 专用命令互不替代。若不希望 MCP 启动时创建空的默认输出目录，可用 `scripts/run_mineru_open_mcp_lazy.py` 启动官方 MCP；它不修改官方安装包，显式传入 `output_dir` 的行为保持不变。
 
 单批预检与提交：
 

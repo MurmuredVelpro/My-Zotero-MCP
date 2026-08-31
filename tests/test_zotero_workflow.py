@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from zotero_mcp import zotero_workflow
+from zotero_mcp import workflow_database, zotero_workflow
 
 
 class WorkflowStoreTests(unittest.TestCase):
@@ -279,6 +279,38 @@ class WorkflowStoreTests(unittest.TestCase):
             ("retry_wait", 1, "", "2026-08-20T12:10:00+00:00"),
         )
 
+    def test_sync_preserves_pdf_acquisition_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            database = Path(tmp) / "workflow.sqlite3"
+            snapshot = self.snapshot()
+            zotero_workflow.store_snapshot(database, snapshot)
+            workflow_database.save_pdf_acquisition_records(
+                [
+                    {
+                        "item_key": "AB12CD34",
+                        "state": "eligible_publisher_vor",
+                        "candidate_url": "https://publisher.example/paper.pdf",
+                        "source_kind": "crossref_link",
+                        "version_kind": "published",
+                        "access_kind": "public_open",
+                        "evidence_json": "{}",
+                        "checked_at": snapshot.observed_at,
+                        "next_check_at": None,
+                        "downloaded_at": None,
+                        "last_error": "",
+                    }
+                ],
+                database,
+            )
+            zotero_workflow.store_snapshot(database, snapshot)
+            status = zotero_workflow.status_data(database, "AB12CD34")
+
+        self.assertEqual(status["pdf_acquisition"]["state"], "eligible_publisher_vor")
+        self.assertEqual(
+            status["pdf_acquisition"]["candidate_url"],
+            "https://publisher.example/paper.pdf",
+        )
+
     def test_later_sync_marks_removed_item_out_of_scope(self):
         with tempfile.TemporaryDirectory() as tmp:
             database = Path(tmp) / "workflow.sqlite3"
@@ -314,6 +346,7 @@ class WorkflowStoreTests(unittest.TestCase):
             self.assertEqual(rows[0]["source_attachment_key"], "EN12PDF3")
             self.assertEqual(rows[0]["translation_attachment_key"], "CN34PDF5")
             self.assertEqual(rows[0]["collection_paths"], "Senescence")
+            self.assertEqual(rows[0]["pdf_acquisition_state"], "unchecked")
 
     def test_collection_reference_distinguishes_key_name_and_path(self):
         self.assertEqual(

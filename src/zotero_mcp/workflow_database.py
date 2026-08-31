@@ -49,6 +49,37 @@ CREATE INDEX IF NOT EXISTS mineru_batches_collection_idx
     ON mineru_batches(collection_key, updated_at);
 """
 
+PDF_ACQUISITION_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS pdf_acquisition (
+    item_key TEXT PRIMARY KEY REFERENCES items(item_key),
+    state TEXT NOT NULL,
+    candidate_url TEXT,
+    source_kind TEXT,
+    version_kind TEXT,
+    access_kind TEXT,
+    evidence_json TEXT NOT NULL,
+    checked_at TEXT NOT NULL,
+    next_check_at TEXT,
+    downloaded_at TEXT,
+    last_error TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS pdf_acquisition_state_idx
+    ON pdf_acquisition(state, next_check_at);
+"""
+
+PDF_ACQUISITION_STATES = {
+    "unchecked",
+    "not_needed",
+    "eligible_publisher_vor",
+    "eligible_pmc_vor",
+    "eligible_official_preprint",
+    "manual_version_unproven",
+    "manual_no_vor_found",
+    "blocked",
+    "failed_validation",
+    "downloaded",
+}
+
 
 def utc_now() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds")
@@ -66,9 +97,143 @@ def connect(path: Path | None = None) -> sqlite3.Connection:
     connection.execute("PRAGMA foreign_keys = ON")
     connection.execute("PRAGMA busy_timeout = 5000")
     connection.executescript(MINERU_SCHEMA_SQL)
+    connection.executescript(PDF_ACQUISITION_SCHEMA_SQL)
     if os.name != "nt":
         os.chmod(selected, 0o600)
     return connection
+
+
+def save_pdf_acquisition_records(
+    records: list[dict[str, Any]], path: Path | None = None
+) -> None:
+    with connect(path) as connection:
+        for record in records:
+            item_key = str(record.get("item_key") or "").strip().upper()
+            state = str(record.get("state") or "").strip()
+            if not item_key:
+                raise ValueError("PDF acquisition item_key is required")
+            if state not in PDF_ACQUISITION_STATES:
+                raise ValueError(f"Invalid PDF acquisition state: {state}")
+            existing = connection.execute(
+                "SELECT state FROM pdf_acquisition WHERE item_key=?", (item_key,)
+            ).fetchone()
+            if existing is not None and (
+                (
+                    state == "blocked"
+                    and (
+                        str(existing["state"]).startswith("eligible_")
+                        or existing["state"] == "downloaded"
+                    )
+                )
+                or (state == "not_needed" and existing["state"] == "downloaded")
+            ):
+                connection.execute(
+                    """
+                    UPDATE pdf_acquisition
+                    SET checked_at=?, next_check_at=?, last_error=?
+                    WHERE item_key=?
+                    """,
+                    (
+                        str(record.get("checked_at") or ""),
+                        record.get("next_check_at"),
+                        str(record.get("last_error") or ""),
+                        item_key,
+                    ),
+                )
+                continue
+            values = {
+                "item_key": item_key,
+                "state": state,
+                "candidate_url": record.get("candidate_url"),
+                "source_kind": record.get("source_kind"),
+                "version_kind": record.get("version_kind"),
+                "access_kind": record.get("access_kind"),
+                "evidence_json": str(record.get("evidence_json") or "{}"),
+                "checked_at": str(record.get("checked_at") or ""),
+                "next_check_at": record.get("next_check_at"),
+                "downloaded_at": record.get("downloaded_at"),
+                "last_error": str(record.get("last_error") or ""),
+            }
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO pdf_acquisition(
+                        item_key, state, candidate_url, source_kind, version_kind,
+                        access_kind, evidence_json, checked_at, next_check_at,
+                        downloaded_at, last_error
+                    ) VALUES(
+                        :item_key, :state, :candidate_url, :source_kind,
+                        :version_kind, :access_kind, :evidence_json, :checked_at,
+                        :next_check_at, :downloaded_at, :last_error
+                    )
+                    ON CONFLICT(item_key) DO UPDATE SET
+                        state=excluded.state,
+                        candidate_url=excluded.candidate_url,
+                        source_kind=excluded.source_kind,
+                        version_kind=excluded.version_kind,
+                        access_kind=excluded.access_kind,
+                        evidence_json=excluded.evidence_json,
+                        checked_at=excluded.checked_at,
+                        next_check_at=excluded.next_check_at,
+                        downloaded_at=COALESCE(
+                            excluded.downloaded_at, pdf_acquisition.downloaded_at
+                        ),
+                        last_error=excluded.last_error
+                    """,
+                    values,
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ValueError(
+                    f"workflow item is missing for PDF acquisition: {item_key}; "
+                    "run zotero-workflow sync first"
+                ) from exc
+
+
+def pdf_acquisition_record(
+    item_key: str, path: Path | None = None
+) -> dict[str, Any] | None:
+    selected = (path or default_database_path()).expanduser()
+    if not selected.is_file():
+        return None
+    with connect(selected) as connection:
+        row = connection.execute(
+            "SELECT * FROM pdf_acquisition WHERE item_key=?",
+            (item_key.strip().upper(),),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def mark_pdf_acquisition_failed(
+    item_key: str, error: str, path: Path | None = None
+) -> None:
+    with connect(path) as connection:
+        cursor = connection.execute(
+            """
+            UPDATE pdf_acquisition
+            SET state='failed_validation', checked_at=?, last_error=?
+            WHERE item_key=?
+            """,
+            (utc_now(), error, item_key.strip().upper()),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError(f"No PDF acquisition state for item: {item_key}")
+
+
+def mark_pdf_acquisition_downloaded(
+    item_key: str, downloaded_at: str, path: Path | None = None
+) -> None:
+    with connect(path) as connection:
+        cursor = connection.execute(
+            """
+            UPDATE pdf_acquisition
+            SET state='downloaded', checked_at=?, downloaded_at=?,
+                next_check_at=NULL, last_error=''
+            WHERE item_key=?
+            """,
+            (downloaded_at, downloaded_at, item_key.strip().upper()),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError(f"No PDF acquisition state for item: {item_key}")
 
 
 def mineru_records_by_key(path: Path | None = None) -> dict[str, dict[str, str]]:

@@ -21,6 +21,8 @@ from . import (
     zotero_collections,
     zotero_extract,
     zotero_local,
+    zotero_pdf,
+    zotero_runtime,
     zotero_translate,
     zotero_write,
 )
@@ -400,6 +402,67 @@ def tool_apply_paper_import(arguments: dict[str, Any]) -> dict[str, Any]:
     try:
         return json_result(zotero_write.execute_paper_import(items, confirm))
     except zotero_write.ZoteroWriteError as exc:
+        return text_result(str(exc), True)
+
+
+def tool_plan_pdf_acquisition(arguments: dict[str, Any]) -> dict[str, Any]:
+    item_keys = arguments.get("item_keys")
+    collection = str(arguments.get("collection") or "").strip()
+    if bool(item_keys) == bool(collection):
+        return text_result("Provide exactly one scope: item_keys or collection", True)
+    try:
+        missing_only = bool(arguments.get("missing_only", True))
+        if item_keys:
+            if not isinstance(item_keys, list) or not 1 <= len(item_keys) <= 50:
+                raise zotero_pdf.PdfAcquisitionError(
+                    "item_keys must contain between 1 and 50 Zotero keys"
+                )
+            items = [
+                zotero_local.get_item(str(key).strip().upper()) for key in item_keys
+            ]
+            decisions = zotero_pdf.plan_pdf_acquisition(items)
+            zotero_pdf.save_decisions(decisions)
+            visible = [
+                row for row in decisions if not missing_only or not row.has_english_pdf
+            ]
+            return json_result(
+                {
+                    "scope": "item_keys",
+                    "scanned": len(decisions),
+                    "returned": len(visible),
+                    "items": [row.to_dict() for row in visible],
+                }
+            )
+        return json_result(
+            zotero_pdf.scan_collection(
+                collection,
+                recursive=bool(arguments.get("recursive", False)),
+                missing_only=missing_only,
+                limit=int(arguments.get("limit", 50)),
+            )
+        )
+    except (
+        ValueError,
+        zotero_pdf.PdfAcquisitionError,
+        zotero_runtime.RuntimeConfigError,
+    ) as exc:
+        return text_result(str(exc), True)
+
+
+def tool_apply_pdf_acquisition(arguments: dict[str, Any]) -> dict[str, Any]:
+    try:
+        return json_result(
+            zotero_pdf.apply_pdf_acquisition(
+                arguments.get("item_keys"),
+                arguments.get("confirm") is True,
+                dry_run=bool(arguments.get("dry_run", False)),
+            )
+        )
+    except (
+        ValueError,
+        zotero_pdf.PdfAcquisitionError,
+        zotero_runtime.RuntimeConfigError,
+    ) as exc:
         return text_result(str(exc), True)
 
 
@@ -1207,6 +1270,74 @@ TOOLS: dict[str, dict[str, Any]] = {
         },
         "handler": tool_apply_paper_import,
     },
+    "zotero_plan_pdf_acquisition": {
+        "description": (
+            "Discover legal public PDFs for exact Zotero items or one collection, accept only "
+            "verified Version of Record PDFs or official PDFs for true preprint items, reject "
+            "author/accepted/submitted manuscripts, and save discovery evidence in the shared "
+            "SQLite workflow database. Does not download a PDF or write Zotero."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "item_keys": {
+                    "type": "array",
+                    "items": {"type": "string", "pattern": "^[A-Z0-9]{8}$"},
+                    "minItems": 1,
+                    "maxItems": 50,
+                },
+                "collection": {
+                    "type": "string",
+                    "description": "Exact collection key, unique name, or full path.",
+                },
+                "recursive": {"type": "boolean", "default": False},
+                "missing_only": {"type": "boolean", "default": True},
+                "limit": {"type": "integer", "minimum": 1, "default": 50},
+            },
+            "additionalProperties": False,
+        },
+        "annotations": {
+            "readOnlyHint": False,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": True,
+        },
+        "handler": tool_plan_pdf_acquisition,
+    },
+    "zotero_apply_pdf_acquisition": {
+        "description": (
+            "Revalidate an explicitly reviewed eligible PDF plan, download and validate the "
+            "public Version of Record PDF, render the current Zotero attachment filename "
+            "template, upload one imported-file attachment titled PDF through Web API/WebDAV, "
+            "and verify cloud and local readback. Never replaces an existing English PDF. "
+            "Requires exact item keys and confirm=true."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "item_keys": {
+                    "type": "array",
+                    "items": {"type": "string", "pattern": "^[A-Z0-9]{8}$"},
+                    "minItems": 1,
+                    "maxItems": 50,
+                },
+                "confirm": {
+                    "type": "boolean",
+                    "description": "Must be true to authorize download and Zotero attachment write.",
+                },
+                "dry_run": {"type": "boolean", "default": False},
+            },
+            "required": ["item_keys", "confirm"],
+            "additionalProperties": False,
+        },
+        "annotations": {
+            "readOnlyHint": False,
+            "destructiveHint": False,
+            "idempotentHint": True,
+            "openWorldHint": True,
+        },
+        "handler": tool_apply_pdf_acquisition,
+    },
     "zotero_plan_collection_reconcile": {
         "description": (
             "Read-only preflight for adding and removing collection memberships on up to 50 "
@@ -1599,6 +1730,7 @@ TOOLSETS: dict[str, tuple[str, ...]] = {
         "zotero_web_api_status",
         "zotero_plan_paper_import",
         "zotero_apply_paper_import",
+        "zotero_plan_pdf_acquisition",
     ),
     "review": (
         "zotero_item",
@@ -1621,6 +1753,7 @@ TOOLSETS: dict[str, tuple[str, ...]] = {
         "zotero_apply_collection_reconcile",
         "zotero_plan_pdf_attachment_delete",
         "zotero_apply_pdf_attachment_delete",
+        "zotero_apply_pdf_acquisition",
         "zotero_plan_manual_translation_rename",
         "zotero_apply_manual_translation_rename",
     ),

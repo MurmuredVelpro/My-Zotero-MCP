@@ -34,6 +34,20 @@ local_api = "http://<WSL_GATEWAY_IP>:23120/api"
 
 Do not expose this proxy on a public network interface.
 
+## OA PDF download reports that the Wiley proxy is unavailable
+
+Zotero MCP ignores shell `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` settings.
+Local Zotero and PDF2zh requests use the `LOCAL` route. Ordinary Zotero,
+repository, metadata, WebDAV, MinerU, and publisher requests use the `NORMAL`
+route through the current Windows gateway on port `17892`. Wiley and every
+later hop in a Wiley redirect chain use the dedicated `PROXY_REQUIRED` port
+`17893`, whose Mihomo listener is pinned to the approved proxy group.
+
+Confirm that Mihomo is running, the WSL-to-Windows `17892` and `17893`
+forwarding paths are reachable, and the approved proxy uplink is present.
+Neither external route falls back to WSL direct access. In particular, do not
+work around a Wiley error by allowing it to fall back to the campus network.
+
 ## Attachment storage is missing
 
 Local API metadata may work while PDF tools fail. Set `zotero.storage` to the actual local Zotero `storage` directory. For WSL, convert `D:\Zotero\storage` to `/mnt/d/Zotero/storage`.

@@ -13,7 +13,7 @@ from typing import Any
 
 import requests
 
-from . import zotero_runtime
+from . import zotero_http, zotero_runtime
 
 DEFAULT_WEB_API_BASE = "https://api.zotero.org"
 DEFAULT_WEB_API_KEY_FILE = "zotero_web_api_key.secret"
@@ -158,13 +158,17 @@ def web_api_request(
     for attempt in range(max_attempts):
         _wait_for_backoff()
         try:
-            response = requests.request(
+            request_kwargs = {
+                "params": params,
+                "json": payload,
+                "headers": request_headers,
+                "timeout": timeout,
+            }
+            response = zotero_http.request(
                 method,
                 url,
-                params=params,
-                json=payload,
-                headers=request_headers,
-                timeout=timeout,
+                route=zotero_http.RouteType.NORMAL,
+                **request_kwargs,
             )
         except requests.RequestException as exc:
             if method_upper in {"GET", "HEAD"} and attempt + 1 < max_attempts:

@@ -133,6 +133,27 @@ class WebApiTransportTests(unittest.TestCase):
         },
     }
 
+    def test_web_api_declares_normal_route(self):
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"NO_PROXY": "api.zotero.org", "no_proxy": "api.zotero.org"},
+                clear=True,
+            ),
+            mock.patch.object(zotero_web_api, "web_api_key", return_value="secret"),
+            mock.patch.object(
+                zotero_web_api.zotero_http,
+                "request",
+                return_value=FakeResponse(200),
+            ) as request,
+        ):
+            zotero_web_api.web_api_request("GET", "users/1/items")
+
+        self.assertIs(
+            request.call_args.kwargs["route"],
+            zotero_web_api.zotero_http.RouteType.NORMAL,
+        )
+
     def test_status_validates_user_and_personal_library_write_access(self):
         with (
             mock.patch.object(zotero_web_api, "web_api_key", return_value="secret"),
@@ -184,7 +205,7 @@ class WebApiTransportTests(unittest.TestCase):
         with (
             mock.patch.object(zotero_web_api, "web_api_key", return_value="secret"),
             mock.patch.object(
-                zotero_web_api.requests,
+                zotero_web_api.zotero_http,
                 "request",
                 side_effect=zotero_web_api.requests.Timeout("timed out"),
             ) as write_request,
@@ -198,7 +219,7 @@ class WebApiTransportTests(unittest.TestCase):
         with (
             mock.patch.object(zotero_web_api, "web_api_key", return_value="secret"),
             mock.patch.object(
-                zotero_web_api.requests,
+                zotero_web_api.zotero_http,
                 "request",
                 side_effect=zotero_web_api.requests.Timeout("timed out"),
             ),
@@ -214,7 +235,7 @@ class WebApiTransportTests(unittest.TestCase):
         with (
             mock.patch.object(zotero_web_api, "web_api_key", return_value="secret"),
             mock.patch.object(
-                zotero_web_api.requests,
+                zotero_web_api.zotero_http,
                 "request",
                 side_effect=responses,
             ) as request,
@@ -231,7 +252,7 @@ class WebApiTransportTests(unittest.TestCase):
         with (
             mock.patch.object(zotero_web_api, "web_api_key", return_value="secret"),
             mock.patch.object(
-                zotero_web_api.requests,
+                zotero_web_api.zotero_http,
                 "request",
                 side_effect=responses,
             ) as request,
@@ -248,7 +269,7 @@ class WebApiTransportTests(unittest.TestCase):
         with (
             mock.patch.object(zotero_web_api, "web_api_key", return_value="secret"),
             mock.patch.object(
-                zotero_web_api.requests,
+                zotero_web_api.zotero_http,
                 "request",
                 return_value=FakeResponse(429, headers={"Retry-After": "3"}),
             ) as request,
@@ -269,7 +290,7 @@ class WebApiTransportTests(unittest.TestCase):
         with (
             mock.patch.object(zotero_web_api, "web_api_key", return_value="secret"),
             mock.patch.object(
-                zotero_web_api.requests,
+                zotero_web_api.zotero_http,
                 "request",
                 side_effect=responses,
             ),

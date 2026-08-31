@@ -46,6 +46,16 @@ TOOL_CONTRACTS = {
         ("items", "confirm"),
         WRITE,
     ),
+    "zotero_plan_pdf_acquisition": (
+        ("item_keys", "collection", "recursive", "missing_only", "limit"),
+        (),
+        WRITE,
+    ),
+    "zotero_apply_pdf_acquisition": (
+        ("item_keys", "confirm", "dry_run"),
+        ("item_keys", "confirm"),
+        WRITE,
+    ),
     "zotero_plan_collection_reconcile": (
         ("items", "allow_no_collections"),
         ("items",),
@@ -245,13 +255,15 @@ class CollectionToolTests(unittest.TestCase):
         tools = {
             tool["name"]: tool for tool in zotero_mcp_server.tool_definitions("all")
         }
-        self.assertEqual(len(tools), 26)
+        self.assertEqual(len(tools), 28)
         self.assertTrue(
             {
                 "zotero_get_annotations",
                 "zotero_get_notes",
                 "zotero_get_citation_key",
                 "zotero_apply_pdf_attachment_delete",
+                "zotero_plan_pdf_acquisition",
+                "zotero_apply_pdf_acquisition",
                 "zotero_plan_manual_translation_rename",
                 "zotero_apply_manual_translation_rename",
             }.issubset(tools)
@@ -848,6 +860,44 @@ class CollectionToolTests(unittest.TestCase):
         self.assertTrue(result["isError"])
         self.assertIn("confirm=true", result["content"][0]["text"])
         execute.assert_called_once_with([{"title": "A"}], False)
+
+    def test_pdf_acquisition_tools_forward_exact_item_scope(self):
+        planned = mock.Mock(has_english_pdf=False)
+        planned.to_dict.return_value = {
+            "item_key": "ABCD1234",
+            "state": "eligible_publisher_vor",
+        }
+        with (
+            mock.patch.object(
+                zotero_mcp_server.zotero_local,
+                "get_item",
+                return_value={"data": {"key": "ABCD1234"}},
+            ),
+            mock.patch.object(
+                zotero_mcp_server.zotero_pdf,
+                "plan_pdf_acquisition",
+                return_value=[planned],
+            ) as plan,
+            mock.patch.object(zotero_mcp_server.zotero_pdf, "save_decisions") as save,
+        ):
+            result = zotero_mcp_server.tool_plan_pdf_acquisition(
+                {"item_keys": ["ABCD1234"], "missing_only": True}
+            )
+        self.assertFalse(result["isError"])
+        plan.assert_called_once()
+        save.assert_called_once_with([planned])
+
+        applied = {"applied": 1, "items": [{"item_key": "ABCD1234"}]}
+        with mock.patch.object(
+            zotero_mcp_server.zotero_pdf,
+            "apply_pdf_acquisition",
+            return_value=applied,
+        ) as apply:
+            result = zotero_mcp_server.tool_apply_pdf_acquisition(
+                {"item_keys": ["ABCD1234"], "confirm": True}
+            )
+        self.assertFalse(result["isError"])
+        apply.assert_called_once_with(["ABCD1234"], True, dry_run=False)
 
     def test_plan_collection_reconcile_returns_json(self):
         payload = {"total": 1, "summary": {"reconcile": 1}, "results": []}

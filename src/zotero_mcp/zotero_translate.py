@@ -7,7 +7,6 @@ import argparse
 import base64
 import configparser
 import csv
-import hashlib
 import ipaddress
 import json
 import os
@@ -16,10 +15,7 @@ import shlex
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
-import uuid
-import zipfile
 from collections import deque
 from collections.abc import Callable, Iterator, Mapping
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
@@ -33,7 +29,13 @@ from urllib.parse import quote, urlsplit, urlunsplit
 
 import requests
 
-from . import zotero_local, zotero_runtime, zotero_web_api
+from . import (
+    zotero_attachment,
+    zotero_http,
+    zotero_local,
+    zotero_runtime,
+    zotero_web_api,
+)
 from .zotero_collections import resolve_collection
 
 QUEUE_FIELDS = (
@@ -683,7 +685,7 @@ def server_url_candidates(server_url: str) -> list[str]:
     candidates = [server_url.rstrip("/")]
     parsed = urlsplit(server_url)
     if zotero_runtime.is_wsl() and parsed.hostname in {"127.0.0.1", "localhost"}:
-        gateway = zotero_local.wsl_gateway_ip()
+        gateway = zotero_http.wsl_gateway_ip()
         if gateway:
             netloc = gateway + (f":{parsed.port}" if parsed.port else "")
             candidates.append(
@@ -726,7 +728,10 @@ class PDF2ZHClient:
         output_dir: Path | None = None,
         naming: TranslationNaming | None = None,
     ) -> None:
-        self.session = session or requests.Session()
+        self.session = zotero_http.routed_session(
+            zotero_http.RouteType.LOCAL,
+            session,
+        )
         self.output_dir = output_dir or default_output_dir()
         self.naming = naming or DEFAULT_TRANSLATION_NAMING
         self.base_url = ""
@@ -1755,7 +1760,7 @@ def load_webdav_config(
     return url.rstrip("/") + "/", username, password, timeout, source
 
 
-class ZoteroAttachmentClient:
+class ZoteroAttachmentClient(zotero_attachment.ZoteroAttachmentClient):
     def __init__(
         self,
         session: requests.Session | None = None,
@@ -1763,357 +1768,50 @@ class ZoteroAttachmentClient:
         environ: Mapping[str, str] | None = None,
         naming: TranslationNaming | None = None,
     ) -> None:
-        self.session = session or requests.Session()
-        self.api = api
-        self.environ = environ
         self.naming = naming or DEFAULT_TRANSLATION_NAMING
+        super().__init__(
+            config_loader=load_webdav_config,
+            session=session,
+            api=api,
+            environ=environ,
+        )
+
+    @staticmethod
+    def _translation_error(
+        exc: zotero_attachment.ZoteroAttachmentError,
+    ) -> TranslationError:
+        message = str(exc)
+        if message.startswith("multiple matching attachments for "):
+            parent_key = message.rsplit(" ", 1)[-1]
+            message = f"multiple existing translation attachments for {parent_key}"
+        return TranslationError(message)
 
     def configuration_status(self) -> dict[str, Any]:
-        _, _, _, timeout, source = load_webdav_config(self.environ)
-        return {"configured": True, "source": source, "timeout": timeout}
-
-    def _config(self) -> tuple[str, str, str, float]:
-        url, username, password, timeout, _ = load_webdav_config(self.environ)
-        return url, username, password, timeout
-
-    def _verify_webdav_write(self, base_url: str, timeout: float) -> None:
-        probe_url = f"{base_url}zotero-mcp-write-test-{uuid.uuid4().hex}.tmp"
-        put_error: TranslationError | None = None
         try:
-            response = self.session.put(
-                probe_url,
-                data=b"",
-                headers={"Content-Type": "application/octet-stream"},
-                timeout=(10.0, min(timeout, 30.0)),
-            )
-            if response.status_code not in {200, 201, 204}:
-                put_error = TranslationError(
-                    f"WebDAV write check failed with HTTP {response.status_code}"
-                )
-        except requests.RequestException as exc:
-            put_error = TranslationError(
-                f"WebDAV write check failed: {type(exc).__name__}: {exc}"
-            )
-
-        try:
-            cleanup = self.session.delete(
-                probe_url,
-                timeout=(10.0, min(timeout, 30.0)),
-            )
-        except requests.RequestException as exc:
-            raise TranslationError(
-                f"WebDAV write-check cleanup failed: {type(exc).__name__}: {exc}"
-            ) from exc
-        if cleanup.status_code not in {200, 204, 404}:
-            raise TranslationError(
-                f"WebDAV write-check cleanup failed with HTTP {cleanup.status_code}"
-            )
-        if put_error is not None:
-            raise put_error
+            return super().configuration_status()
+        except zotero_attachment.ZoteroAttachmentError as exc:
+            raise self._translation_error(exc) from exc
 
     def preflight(self, *, verify_write: bool = False) -> int:
-        status = self.api.web_api_status()
-        user_id = status.get("user_id")
-        if not isinstance(user_id, int) or user_id < 1:
-            raise TranslationError("Zotero Web API returned an invalid user_id")
-        if status.get("files_write") is not True:
-            raise TranslationError("Zotero Web API key lacks file write access")
-        base_url, username, password, timeout = self._config()
-        self.session.auth = (username, password)
-        response = self.session.request(
-            "PROPFIND",
-            base_url,
-            headers={"Depth": "0"},
-            timeout=(10.0, min(timeout, 30.0)),
-        )
-        if response.status_code not in {200, 204, 207}:
-            raise TranslationError(
-                f"WebDAV credential check failed with HTTP {response.status_code}"
-            )
-        if verify_write:
-            self._verify_webdav_write(base_url, timeout)
-        return user_id
-
-    def _cloud_children(self, user_id: int, parent_key: str) -> list[dict[str, Any]]:
-        children: list[dict[str, Any]] = []
-        start = 0
-        while True:
-            page = self.api.web_api_request_json(
-                "GET",
-                f"users/{user_id}/items/{parent_key}/children",
-                params={"limit": 100, "start": start},
-                timeout=30.0,
-            )
-            if not isinstance(page, list) or any(
-                not isinstance(row, dict) for row in page
-            ):
-                raise TranslationError("Zotero Web API children response was invalid")
-            children.extend(page)
-            if len(page) < 100:
-                return children
-            start += len(page)
-
-    @staticmethod
-    def _file_md5(path: Path) -> str:
-        digest = hashlib.md5()  # Zotero WebDAV requires MD5.
-        with path.open("rb") as handle:
-            for chunk in iter(lambda: handle.read(65536), b""):
-                digest.update(chunk)
-        return digest.hexdigest()
-
-    @staticmethod
-    def _created_attachment(response: Any) -> tuple[str, int | None]:
-        if not isinstance(response, dict):
-            raise TranslationError(
-                "attachment creation returned invalid data; unknown write state"
-            )
-        entry: Any = (response.get("success") or {}).get("0")
-        detailed = (response.get("successful") or {}).get("0")
-        if entry is None:
-            entry = detailed
-        version: Any = (response.get("successVersions") or {}).get("0")
-        if isinstance(detailed, dict):
-            version = detailed.get("version", version)
-        if isinstance(entry, dict):
-            version = entry.get("version", version)
-            entry = entry.get("key") or (entry.get("data") or {}).get("key")
-        key = str(entry or "").upper()
-        if not ZOTERO_KEY_RE.fullmatch(key):
-            failure = (response.get("failed") or {}).get("0")
-            if failure:
-                raise TranslationError(
-                    f"Zotero rejected attachment creation: {failure}"
-                )
-            raise TranslationError(
-                "attachment creation returned no key; unknown write state"
-            )
-        return key, version if isinstance(version, int) and version > 0 else None
-
-    @staticmethod
-    def _validate_attachment(
-        item: dict[str, Any],
-        attachment_key: str,
-        parent_key: str,
-        filename: str,
-        md5_hex: str,
-        mtime_ms: int,
-        expected_title: str,
-    ) -> int:
-        data = item.get("data") or {}
-        checks = {
-            "key": item_key(item) == attachment_key,
-            "parentItem": str(data.get("parentItem") or "") == parent_key,
-            "title": str(data.get("title") or "") == expected_title,
-            "linkMode": str(data.get("linkMode") or "") == "imported_file",
-            "contentType": str(data.get("contentType") or "") == "application/pdf",
-            "filename": str(data.get("filename") or "") == filename,
-            "md5": str(data.get("md5") or "").lower() == md5_hex,
-        }
         try:
-            checks["mtime"] = int(data.get("mtime")) == mtime_ms
-        except (TypeError, ValueError):
-            checks["mtime"] = False
-        failed = [name for name, valid in checks.items() if not valid]
-        if failed:
-            raise TranslationError(
-                f"Zotero attachment {attachment_key} failed read-back: "
-                + ", ".join(failed)
-            )
-        version = item.get("version", data.get("version"))
-        if not isinstance(version, int) or version < 1:
-            raise TranslationError(f"Zotero attachment {attachment_key} has no version")
-        return version
-
-    @staticmethod
-    def _same_file(
-        item: dict[str, Any],
-        parent_key: str,
-        filename: str,
-        md5_hex: str,
-        mtime_ms: int,
-    ) -> bool:
-        data = item.get("data") or {}
-        try:
-            existing_mtime = int(data.get("mtime"))
-        except (TypeError, ValueError):
-            return False
-        return (
-            str(data.get("parentItem") or "") == parent_key
-            and str(data.get("linkMode") or "") == "imported_file"
-            and str(data.get("filename") or "") == filename
-            and str(data.get("md5") or "").lower() == md5_hex
-            and existing_mtime == mtime_ms
-        )
-
-    def _upload_webdav(
-        self, attachment_key: str, file_path: Path, md5_hex: str, mtime_ms: int
-    ) -> None:
-        base_url, username, password, timeout = self._config()
-        self.session.auth = (username, password)
-        encoded_key = quote(attachment_key, safe="")
-        properties = (
-            '<properties version="1">'
-            f"<mtime>{mtime_ms}</mtime><hash>{md5_hex}</hash>"
-            "</properties>"
-        ).encode()
-        with tempfile.TemporaryDirectory(prefix="zotero-webdav-") as temp_dir:
-            archive = Path(temp_dir) / f"{attachment_key}.zip"
-            with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as handle:
-                handle.write(file_path, arcname=file_path.name)
-            with archive.open("rb") as handle:
-                response = self.session.put(
-                    f"{base_url}{encoded_key}.zip",
-                    data=handle,
-                    headers={"Content-Type": "application/zip"},
-                    timeout=(10.0, timeout),
-                )
-                response.raise_for_status()
-        response = self.session.put(
-            f"{base_url}{encoded_key}.prop",
-            data=properties,
-            headers={"Content-Type": "text/xml; charset=utf-8"},
-            timeout=(10.0, timeout),
-        )
-        response.raise_for_status()
-
-    def _cleanup(
-        self, user_id: int, attachment_key: str, version: int | None
-    ) -> list[str]:
-        errors: list[str] = []
-        try:
-            base_url, username, password, timeout = self._config()
-            self.session.auth = (username, password)
-            encoded_key = quote(attachment_key, safe="")
-            for suffix in ("prop", "zip"):
-                response = self.session.delete(
-                    f"{base_url}{encoded_key}.{suffix}", timeout=(10.0, timeout)
-                )
-                if response.status_code not in {200, 204, 404}:
-                    errors.append(f"WebDAV {suffix} DELETE HTTP {response.status_code}")
-        except Exception as exc:  # noqa: BLE001 - cleanup must remain best effort
-            errors.append(f"WebDAV cleanup failed: {exc}")
-        try:
-            if version is None:
-                current = self.api.web_api_get_item(user_id, attachment_key)
-                version = current.get(
-                    "version", (current.get("data") or {}).get("version")
-                )
-            if not isinstance(version, int) or version < 1:
-                raise TranslationError("attachment version is unavailable")
-            response = self.api.web_api_request(
-                "DELETE",
-                f"users/{user_id}/items/{attachment_key}",
-                headers={"If-Unmodified-Since-Version": str(version)},
-                timeout=30.0,
-            )
-            if response.status_code not in {204, 404}:
-                errors.append(f"Zotero attachment DELETE HTTP {response.status_code}")
-        except Exception as exc:  # noqa: BLE001 - cleanup must remain best effort
-            errors.append(f"Zotero attachment cleanup failed: {exc}")
-        return errors
+            return super().preflight(verify_write=verify_write)
+        except zotero_attachment.ZoteroAttachmentError as exc:
+            raise self._translation_error(exc) from exc
 
     def import_pdf(
         self, user_id: int, parent_key: str, file_path: Path
     ) -> dict[str, Any]:
-        validate_pdf(file_path)
-        parent = self.api.web_api_get_item(user_id, parent_key)
-        data = parent.get("data") or {}
-        if data.get("itemType") in {"attachment", "annotation", "note"} or data.get(
-            "parentItem"
-        ):
-            raise TranslationError(f"Zotero parent is not top-level: {parent_key}")
-        md5_hex = self._file_md5(file_path)
-        mtime_ms = int(file_path.stat().st_mtime * 1000)
-        existing_matches = [
-            child
-            for child in self._cloud_children(user_id, parent_key)
-            if is_cn_pdf_attachment(child, self.naming)
-        ]
-        if len(existing_matches) > 1:
-            raise TranslationError(
-                f"multiple existing translation attachments for {parent_key}"
-            )
-        existing = existing_matches[0] if existing_matches else None
-        if existing:
-            existing_key = item_key(existing)
-            if not ZOTERO_KEY_RE.fullmatch(existing_key):
-                raise TranslationError(
-                    "existing translation attachment has no valid Zotero key"
-                )
-            refreshed = False
-            if self._same_file(existing, parent_key, file_path.name, md5_hex, mtime_ms):
-                self._upload_webdav(existing_key, file_path, md5_hex, mtime_ms)
-                refreshed = True
-            return {
-                "ok": True,
-                "already_present": True,
-                "attachment_key": existing_key,
-                "webdav_refreshed": refreshed,
-            }
-
-        payload = {
-            "itemType": "attachment",
-            "linkMode": "imported_file",
-            "title": self.naming.attachment_title,
-            "parentItem": parent_key,
-            "contentType": "application/pdf",
-            "charset": "",
-            "filename": file_path.name,
-            "md5": md5_hex,
-            "mtime": mtime_ms,
-            "note": "",
-            "tags": [],
-            "relations": {},
-        }
-        attachment_key = ""
-        version: int | None = None
         try:
-            creation = self.api.web_api_request_json(
-                "POST",
-                f"users/{user_id}/items",
-                payload=[payload],
-                headers={"Zotero-Write-Token": uuid.uuid4().hex},
-                timeout=45.0,
-            )
-            attachment_key, version = self._created_attachment(creation)
-            created = self.api.web_api_get_item(user_id, attachment_key)
-            version = self._validate_attachment(
-                created,
-                attachment_key,
+            return super().import_pdf(
+                user_id,
                 parent_key,
-                file_path.name,
-                md5_hex,
-                mtime_ms,
+                file_path,
                 self.naming.attachment_title,
-            )
-            self._upload_webdav(attachment_key, file_path, md5_hex, mtime_ms)
-            verified = self.api.web_api_get_item(user_id, attachment_key)
-            self._validate_attachment(
-                verified,
-                attachment_key,
-                parent_key,
                 file_path.name,
-                md5_hex,
-                mtime_ms,
-                self.naming.attachment_title,
+                existing_match=lambda child: is_cn_pdf_attachment(child, self.naming),
             )
-        except Exception as exc:
-            if attachment_key:
-                cleanup_errors = self._cleanup(user_id, attachment_key, version)
-                if cleanup_errors:
-                    raise TranslationError(
-                        f"attachment import failed for {attachment_key}: {exc}; cleanup incomplete: "
-                        + "; ".join(cleanup_errors)
-                    ) from exc
-            if isinstance(exc, TranslationError):
-                raise
-            raise TranslationError(f"Zotero attachment import failed: {exc}") from exc
-        return {
-            "ok": True,
-            "already_present": False,
-            "attachment_key": attachment_key,
-            "title": self.naming.attachment_title,
-        }
+        except zotero_attachment.ZoteroAttachmentError as exc:
+            raise self._translation_error(exc) from exc
 
 
 @dataclass(frozen=True)

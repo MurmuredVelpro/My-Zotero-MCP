@@ -8,7 +8,7 @@ from urllib.parse import urlsplit, urlunsplit
 
 import requests
 
-from . import zotero_local
+from . import zotero_http, zotero_local
 
 BETTER_BIBTEX_TRANSLATOR_ID = "ca65189f-8815-4afe-8c8b-8c7c15f0edca"
 
@@ -34,8 +34,9 @@ def better_bibtex_url() -> str:
 def json_rpc(method: str, params: list[Any] | dict[str, Any]) -> Any:
     payload = {"jsonrpc": "2.0", "method": method, "params": params, "id": 1}
     try:
-        response = requests.post(
+        response = zotero_http.post(
             better_bibtex_url(),
+            route=zotero_http.RouteType.LOCAL,
             json=payload,
             timeout=30,
             headers={

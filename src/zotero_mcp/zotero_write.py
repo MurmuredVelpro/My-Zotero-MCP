@@ -25,7 +25,7 @@ from urllib.parse import quote
 
 import requests
 
-from . import zotero_collections, zotero_local, zotero_web_api
+from . import zotero_collections, zotero_http, zotero_local, zotero_web_api
 
 USER_AGENT = zotero_web_api.USER_AGENT
 ZOTERO_KEY_RE = re.compile(r"^[A-Z0-9]{8}$")
@@ -407,8 +407,9 @@ def _metadata_get(
     timeout: float = 20.0,
 ) -> requests.Response:
     try:
-        response = requests.get(
+        response = zotero_http.get(
             url,
+            route=zotero_http.RouteType.NORMAL,
             params=params,
             headers={
                 "User-Agent": USER_AGENT,
